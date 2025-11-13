@@ -1,0 +1,37 @@
+[project]
+name = "ebook-toc"
+version = "0.1.0"
+description = "CLI tool to extract PDF table of contents using SiliconFlow Qwen/Qwen3-VL-32B-Instruct"
+authors = [{ name = "Pi" }]
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "requests>=2.31.0",
+    "rich>=13.0.0",
+    "pymupdf>=1.23.0; python_version < '3.14'",
+]
+
+[project.scripts]
+ebook-toc = "ebooktoc.cli:main"
+
+[build-system]
+requires = ["pdm-backend"]
+build-backend = "pdm.backend"
+
+[tool.pdm]
+package-dir = "ebooktoc"
+
+[tool.pdm.scripts]
+ebook-toc = "python -m ebooktoc.cli"
+
+[tool.pytest.ini_options]
+addopts = "--cov=ebooktoc --cov-report=term-missing:skip-covered"
+testpaths = [
+    "tests",
+]
+
+[dependency-groups]
+test = [
+    "pytest>=7.0,<9.0",
+    "pytest-cov>=4.1.0",
+]
