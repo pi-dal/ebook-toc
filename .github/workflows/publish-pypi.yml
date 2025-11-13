@@ -1,0 +1,52 @@
+name: Publish to PyPI
+
+on:
+  push:
+    tags:
+      - '*.*.*'
+
+jobs:
+  build-and-publish:
+    name: Build and Publish
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Setup PDM
+        uses: pdm-project/setup-pdm@v4
+        with:
+          python-version: '3.12'
+          cache: true
+
+      - name: Set version in pyproject from tag
+        run: |
+          VERSION="${GITHUB_REF#refs/tags/}"
+          echo "Using version: $VERSION"
+          python - <<'PY' "$VERSION"
+import re, sys
+version = sys.argv[1]
+path = 'pyproject.toml'
+with open(path, 'r', encoding='utf-8') as f:
+    content = f.read()
+new = re.sub(r'(?m)^version\s*=\s*"[^"]+"', f'version = "{version}"', content)
+with open(path, 'w', encoding='utf-8') as f:
+    f.write(new)
+print('pyproject.toml version ->', version)
+PY
+
+      - name: Build (PDM)
+        run: |
+          pdm build
+
+      - name: Publish to PyPI (Trusted Publisher)
+        uses: pypa/gh-action-pypi-publish@release/v1

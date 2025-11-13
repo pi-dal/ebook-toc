@@ -1,6 +1,6 @@
 [project]
 name = "ebook-toc"
-version = "0.1.0"
+version = "0.0.1-alpha"
 description = "CLI tool to extract PDF table of contents using SiliconFlow Qwen/Qwen3-VL-32B-Instruct"
 authors = [{ name = "Pi" }]
 readme = "README.md"
@@ -34,4 +34,19 @@ testpaths = [
 test = [
     "pytest>=7.0,<9.0",
     "pytest-cov>=4.1.0",
+]
+
+[tool.pdm.build]
+# Only include the `ebooktoc` package in built artifacts
+includes = [
+    "ebooktoc",
+]
+excludes = [
+    "tests",
+    "output",
+    ".github",
+]
+source-includes = [
+    "README.md",
+    "ebook-toc.png",
 ]
