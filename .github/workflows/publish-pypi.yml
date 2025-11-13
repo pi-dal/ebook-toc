@@ -33,16 +33,16 @@ jobs:
           VERSION="${GITHUB_REF#refs/tags/}"
           echo "Using version: $VERSION"
           python - <<'PY' "$VERSION"
-import re, sys
-version = sys.argv[1]
-path = 'pyproject.toml'
-with open(path, 'r', encoding='utf-8') as f:
-    content = f.read()
-new = re.sub(r'(?m)^version\s*=\s*"[^"]+"', f'version = "{version}"', content)
-with open(path, 'w', encoding='utf-8') as f:
-    f.write(new)
-print('pyproject.toml version ->', version)
-PY
+          import re, sys
+          version = sys.argv[1]
+          path = 'pyproject.toml'
+          with open(path, 'r', encoding='utf-8') as f:
+              content = f.read()
+          new = re.sub(r'(?m)^version\s*=\s*"[^"]+"', f'version = "{version}"', content)
+          with open(path, 'w', encoding='utf-8') as f:
+              f.write(new)
+          print('pyproject.toml version ->', version)
+          PY
 
       - name: Build (PDM)
         run: |
@@ -50,3 +50,4 @@ PY
 
       - name: Publish to PyPI (Trusted Publisher)
         uses: pypa/gh-action-pypi-publish@release/v1
+
