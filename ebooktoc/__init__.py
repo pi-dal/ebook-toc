@@ -12,7 +12,7 @@ __all__ = [
 # Single source of truth: Read version from installed metadata.
 # Falls back to parsing pyproject.toml when running from a source checkout
 # without an installed distribution (e.g., `python -m ebooktoc.cli`).
-from importlib import metadata as _md  # Python 3.10+
+from importlib import metadata as _md  # Safe: project requires Python 3.10+
 
 try:
     __version__ = _md.version("ebook-toc")

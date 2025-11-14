@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "Version to release (e.g. 0.0.1-alpha)"
+        description: "Version to release (e.g., 0.0.1-alpha will be normalized to 0.0.1a0)"
         required: true
         type: string
 
@@ -117,7 +117,8 @@ jobs:
           SDIST=$(ls dist/*.tar.gz | head -n1)
           mkdir -p src
           tar -xzf "$SDIST" -C src
-          cd src/*
+          EXTRACTED_DIR=$(tar -tzf "$SDIST" | head -n1 | cut -d/ -f1)
+          cd "src/$EXTRACTED_DIR"
           ARCH=$(uname -m)
           OUT="../../dist/ebook-toc-${{ steps.meta.outputs.version }}-${{ matrix.os_label }}-${ARCH}"
           echo "Building to $OUT"
@@ -159,27 +160,9 @@ jobs:
           INPUT_VERSION: ${{ inputs.version }}
         run: |
           echo "Input version: $INPUT_VERSION"
-          python - <<'PY' "$INPUT_VERSION"
-          import re, sys, os
-          raw = sys.argv[1].lstrip('v')
-          raw = raw.split('+', 1)[0]
-          base, norm = raw, raw
-          if '-' in raw:
-              base, suf = raw.split('-', 1)
-              suf = suf.lower()
-              m = re.match(r'^(alpha|beta|rc|a|b|dev)[\.-]?(\d+)?$', suf)
-              if m:
-                  label, num = m.group(1), m.group(2)
-                  label = {'alpha':'a','beta':'b','rc':'rc','a':'a','b':'b','dev':'dev'}[label]
-                  if num is None:
-                      num = '0'
-                  norm = f"{base}{label}{num}"
-          if not re.match(r'^\d', norm):
-              norm = raw
-          with open(os.environ['GITHUB_OUTPUT'], 'a') as fh:
-              fh.write(f"normalized={norm}\n")
-          print('Normalized version:', norm)
-          PY
+          NORM=$(python .github/scripts/normalize_version.py "$INPUT_VERSION")
+          echo "Normalized version: $NORM"
+          echo "normalized=$NORM" >> "$GITHUB_OUTPUT"
 
       - name: Verify version exists on PyPI (enforces PyPI first)
         run: |
@@ -250,7 +233,8 @@ jobs:
           SDIST=$(ls dist/*.tar.gz | head -n1)
           mkdir -p src
           tar -xzf "$SDIST" -C src
-          cd src/*
+          EXTRACTED_DIR=$(tar -tzf "$SDIST" | head -n1 | cut -d/ -f1)
+          cd "src/$EXTRACTED_DIR"
           ARCH=$(uname -m)
           OUT="../../dist/ebook-toc-${{ needs.manual_prepare.outputs.version }}-${{ matrix.os_label }}-${ARCH}"
           echo "Building to $OUT"
