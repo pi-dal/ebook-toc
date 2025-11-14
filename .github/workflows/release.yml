@@ -122,7 +122,7 @@ jobs:
           ARCH=$(uname -m)
           OUT="../../dist/ebook-toc-${{ steps.meta.outputs.version }}-${{ matrix.os_label }}-${ARCH}"
           echo "Building to $OUT"
-          pyapp build -o "$OUT" .
+          pyapp build -o "$OUT"
           chmod +x "$OUT"
 
       - name: Upload PyApp artifact
@@ -238,7 +238,7 @@ jobs:
           ARCH=$(uname -m)
           OUT="../../dist/ebook-toc-${{ needs.manual_prepare.outputs.version }}-${{ matrix.os_label }}-${ARCH}"
           echo "Building to $OUT"
-          pyapp build -o "$OUT" .
+          pyapp build -o "$OUT"
           chmod +x "$OUT"
 
       - name: Upload PyApp artifact
