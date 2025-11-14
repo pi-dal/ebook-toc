@@ -110,6 +110,10 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Build PyApp from latest source
+        env:
+          PYAPP_PROJECT_NAME: ebook-toc
+          PYAPP_PROJECT_VERSION: ${{ steps.meta.outputs.version }}
+          PYAPP_PYTHON_VERSION: "3.13"
         run: |
           set -euxo pipefail
           PYAPP_TAR=pyapp-source.tar.gz
@@ -230,6 +234,10 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Build PyApp from latest source
+        env:
+          PYAPP_PROJECT_NAME: ebook-toc
+          PYAPP_PROJECT_VERSION: ${{ needs.manual_prepare.outputs.version }}
+          PYAPP_PYTHON_VERSION: "3.13"
         run: |
           set -euxo pipefail
           PYAPP_TAR=pyapp-source.tar.gz
