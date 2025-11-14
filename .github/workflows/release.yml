@@ -117,7 +117,7 @@ jobs:
           PYAPP_PROJECT_VERSION: ${{ steps.meta.outputs.version }}
           PYAPP_PYTHON_VERSION: "3.13"
           PYAPP_EXEC_SPEC: "ebooktoc.cli:main"
-          PYAPP_PROJECT_PATH: "dist/ebook_toc-${{ steps.meta.outputs.version }}-py3-none-any.whl"
+          PYAPP_PROJECT_PATH: "../../dist/ebook_toc-${{ steps.meta.outputs.version }}-py3-none-any.whl"
           PYAPP_DISTRIBUTION_EMBED: "1"
         run: |
           set -euxo pipefail
@@ -249,7 +249,7 @@ jobs:
           PYAPP_PROJECT_VERSION: ${{ needs.manual_prepare.outputs.version }}
           PYAPP_PYTHON_VERSION: "3.13"
           PYAPP_EXEC_SPEC: "ebooktoc.cli:main"
-          PYAPP_PROJECT_PATH: "dist/ebook_toc-${{ needs.manual_prepare.outputs.version }}-py3-none-any.whl"
+          PYAPP_PROJECT_PATH: "../../dist/ebook_toc-${{ needs.manual_prepare.outputs.version }}-py3-none-any.whl"
           PYAPP_DISTRIBUTION_EMBED: "1"
         run: |
           set -euxo pipefail
