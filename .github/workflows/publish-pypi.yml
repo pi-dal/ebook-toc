@@ -4,6 +4,7 @@ on:
   push:
     tags:
       - '*.*.*'
+  workflow_dispatch:
 
 jobs:
   build-and-publish:
@@ -28,11 +29,39 @@ jobs:
           python-version: '3.12'
           cache: true
 
-      - name: Set version in pyproject from tag
+      - name: Normalize version (PEP 440) from tag
+        id: ver
         run: |
           VERSION="${GITHUB_REF#refs/tags/}"
           echo "Using version: $VERSION"
           python - <<'PY' "$VERSION"
+          import re, sys, os
+          raw = sys.argv[1].lstrip('v')
+          raw = raw.split('+', 1)[0]  # strip local
+          base, norm = raw, raw
+          if '-' in raw:
+              base, suf = raw.split('-', 1)
+              suf = suf.lower()
+              m = re.match(r'^(alpha|beta|rc|a|b|dev)[\.-]?(\d+)?$', suf)
+              if m:
+                  label, num = m.group(1), m.group(2)
+                  label = {'alpha':'a','beta':'b','rc':'rc','a':'a','b':'b','dev':'dev'}[label]
+                  if num is None:
+                      num = '0'
+                  norm = f"{base}{label}{num}"
+          # basic sanity: must start with digit
+          if not re.match(r'^\d', norm):
+              norm = raw
+          print('RAW_TAG=', raw)
+          print('PEP440_VERSION=', norm)
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as fh:
+              fh.write(f"raw={raw}\n")
+              fh.write(f"normalized={norm}\n")
+          PY
+
+      - name: Set version in pyproject (normalized)
+        run: |
+          python - <<'PY' "${{ steps.ver.outputs.normalized }}"
           import re, sys
           version = sys.argv[1]
           path = 'pyproject.toml'
@@ -47,7 +76,15 @@ jobs:
       - name: Build (PDM)
         run: |
           pdm build
+          echo "${{ steps.ver.outputs.normalized }}" > dist/VERSION.txt
+          echo "${{ steps.ver.outputs.raw }}" > dist/TAG.txt
+
+      - name: Upload dist as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+          if-no-files-found: error
 
       - name: Publish to PyPI (Trusted Publisher)
         uses: pypa/gh-action-pypi-publish@release/v1
-

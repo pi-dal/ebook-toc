@@ -4,7 +4,7 @@
 
 # ebook-toc
 
-[![CI](https://github.com/pi-dal/ebook-toc/actions/workflows/ci.yml/badge.svg)](https://github.com/pi-dal/ebook-toc/actions/workflows/ci.yml)
+[![Tests](https://github.com/pi-dal/ebook-toc/actions/workflows/test.yml/badge.svg)](https://github.com/pi-dal/ebook-toc/actions/workflows/test.yml)
 [![Coverage](https://codecov.io/gh/pi-dal/ebook-toc/graph/badge.svg)](https://codecov.io/gh/pi-dal/ebook-toc)
 
 ebook-toc is a Python CLI that extracts a book’s Table of Contents (TOC) from PDFs using a Vision-Language Model (VLM), then optionally embeds the TOC back into the PDF as bookmarks. The current implementation integrates SiliconFlow’s Qwen3‑VL‑32B‑Instruct for TOC detection and printed‑page offset estimation. It supports scanned PDFs by falling back to page images when text is unavailable.
