@@ -75,9 +75,9 @@ jobs:
       matrix:
         include:
           - os: ubuntu-latest
-            os_label: linux
+            os_label: linux-x64
           - os: ubuntu-22.04-arm
-            os_label: linux
+            os_label: linux-arm64
           - os: macos-latest
             os_label: macos
     permissions:
@@ -117,6 +117,8 @@ jobs:
           PYAPP_PROJECT_VERSION: ${{ steps.meta.outputs.version }}
           PYAPP_PYTHON_VERSION: "3.13"
           PYAPP_EXEC_SPEC: "ebooktoc.cli:main"
+          PYAPP_PROJECT_PATH: "dist/ebook_toc-${{ steps.meta.outputs.version }}-py3-none-any.whl"
+          PYAPP_DISTRIBUTION_EMBED: "1"
         run: |
           set -euxo pipefail
           PYAPP_TAR=pyapp-source.tar.gz
@@ -128,7 +130,7 @@ jobs:
           cargo build --release
           echo "$(pwd)/target/release" >> "$GITHUB_PATH"
 
-      - name: Build PyApp binary
+      - name: Copy PyApp binary
         run: |
           set -euxo pipefail
           ARCH=$(uname -m)
@@ -221,9 +223,9 @@ jobs:
       matrix:
         include:
           - os: ubuntu-latest
-            os_label: linux
+            os_label: linux-x64
           - os: ubuntu-22.04-arm
-            os_label: linux
+            os_label: linux-arm64
           - os: macos-latest
             os_label: macos
     steps:
@@ -235,12 +237,20 @@ jobs:
       - name: Install Rust toolchain (for PyApp)
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Download dist artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist
+
       - name: Build PyApp from latest source
         env:
           PYAPP_PROJECT_NAME: ebook-toc
           PYAPP_PROJECT_VERSION: ${{ needs.manual_prepare.outputs.version }}
           PYAPP_PYTHON_VERSION: "3.13"
           PYAPP_EXEC_SPEC: "ebooktoc.cli:main"
+          PYAPP_PROJECT_PATH: "dist/ebook_toc-${{ needs.manual_prepare.outputs.version }}-py3-none-any.whl"
+          PYAPP_DISTRIBUTION_EMBED: "1"
         run: |
           set -euxo pipefail
           PYAPP_TAR=pyapp-source.tar.gz
@@ -252,13 +262,7 @@ jobs:
           cargo build --release
           echo "$(pwd)/target/release" >> "$GITHUB_PATH"
 
-      - name: Download dist artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: dist
-          path: dist
-
-      - name: Build PyApp binary
+      - name: Copy PyApp binary
         run: |
           set -euxo pipefail
           ARCH=$(uname -m)
