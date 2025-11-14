@@ -15,6 +15,7 @@ jobs:
   create_release:
     name: Create GitHub Release after PyPI
     if: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success' }}
+    needs: build_pyapp_auto
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -45,6 +46,13 @@ jobs:
           echo "tag=$TAG" >> $GITHUB_OUTPUT
           echo "Using normalized version: $VERSION, tag: $TAG"
 
+      - name: Download PyApp artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: pyapp-*
+          path: pyapp
+          merge-multiple: true
+
       - name: Create GitHub Release and upload assets
         uses: softprops/action-gh-release@v2
         with:
@@ -54,15 +62,82 @@ jobs:
           prerelease: ${{ contains(steps.meta.outputs.version, 'a') || contains(steps.meta.outputs.version, 'b') || contains(steps.meta.outputs.version, 'rc') || contains(steps.meta.outputs.version, 'dev') }}
           files: |
             dist/*
+            pyapp/*
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-  manual_release:
-    name: Manual GitHub Release
+  build_pyapp_auto:
+    if: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success' }}
+    name: Build PyApp binaries (auto)
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            os_label: linux
+          - os: macos-latest
+            os_label: macos
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - name: Download dist artifact from previous run
+        uses: dawidd6/action-download-artifact@v3
+        with:
+          run_id: ${{ github.event.workflow_run.id }}
+          name: dist
+          path: dist
+
+      - name: Read version
+        id: meta
+        run: |
+          if [ -f dist/VERSION.txt ]; then
+            VERSION=$(cat dist/VERSION.txt)
+          else
+            echo "VERSION.txt not found; inferring from filenames" >&2
+            VERSION=$(ls dist/*.whl | head -n1 | sed -E 's/.*ebook[_-]toc-([^ -]+)-.*/\1/' || true)
+          fi
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Using normalized version: $VERSION"
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install PyApp
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pyapp
+
+      - name: Build PyApp binary
+        run: |
+          set -euxo pipefail
+          SDIST=$(ls dist/*.tar.gz | head -n1)
+          mkdir -p src
+          tar -xzf "$SDIST" -C src
+          cd src/*
+          ARCH=$(uname -m)
+          OUT="../../dist/ebook-toc-${{ steps.meta.outputs.version }}-${{ matrix.os_label }}-${ARCH}"
+          echo "Building to $OUT"
+          pyapp build -o "$OUT" .
+          chmod +x "$OUT"
+
+      - name: Upload PyApp artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: pyapp-${{ matrix.os_label }}
+          path: dist/ebook-toc-${{ steps.meta.outputs.version }}-${{ matrix.os_label }}-*
+
+  manual_prepare:
+    name: Manual prepare (build sdist)
     if: ${{ github.event_name == 'workflow_dispatch' }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
+    outputs:
+      version: ${{ steps.ver.outputs.normalized }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -132,15 +207,93 @@ jobs:
           pdm build
           echo "${{ steps.ver.outputs.normalized }}" > dist/VERSION.txt
 
+      - name: Upload dist as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+          if-no-files-found: error
+
+  manual_build_pyapp:
+    name: Manual build PyApp binaries
+    if: ${{ github.event_name == 'workflow_dispatch' }}
+    needs: manual_prepare
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            os_label: linux
+          - os: macos-latest
+            os_label: macos
+    steps:
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install PyApp
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pyapp
+
+      - name: Download dist artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist
+
+      - name: Build PyApp binary
+        run: |
+          set -euxo pipefail
+          SDIST=$(ls dist/*.tar.gz | head -n1)
+          mkdir -p src
+          tar -xzf "$SDIST" -C src
+          cd src/*
+          ARCH=$(uname -m)
+          OUT="../../dist/ebook-toc-${{ needs.manual_prepare.outputs.version }}-${{ matrix.os_label }}-${ARCH}"
+          echo "Building to $OUT"
+          pyapp build -o "$OUT" .
+          chmod +x "$OUT"
+
+      - name: Upload PyApp artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: pyapp-${{ matrix.os_label }}
+          path: dist/ebook-toc-${{ needs.manual_prepare.outputs.version }}-${{ matrix.os_label }}-*
+
+  manual_release:
+    name: Manual GitHub Release
+    if: ${{ github.event_name == 'workflow_dispatch' }}
+    needs: [manual_prepare, manual_build_pyapp]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download dist artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist
+
+      - name: Download PyApp artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: pyapp-*
+          path: pyapp
+          merge-multiple: true
+
       - name: Create GitHub Release and upload assets
         uses: softprops/action-gh-release@v2
         with:
-          name: ${{ steps.ver.outputs.normalized }}
-          tag_name: ${{ steps.ver.outputs.normalized }}
+          name: ${{ needs.manual_prepare.outputs.version }}
+          tag_name: ${{ needs.manual_prepare.outputs.version }}
           target_commitish: ${{ github.sha }}
           generate_release_notes: true
-          prerelease: ${{ contains(steps.ver.outputs.normalized, 'a') || contains(steps.ver.outputs.normalized, 'b') || contains(steps.ver.outputs.normalized, 'rc') || contains(steps.ver.outputs.normalized, 'dev') }}
+          prerelease: ${{ contains(needs.manual_prepare.outputs.version, 'a') || contains(needs.manual_prepare.outputs.version, 'b') || contains(needs.manual_prepare.outputs.version, 'rc') || contains(needs.manual_prepare.outputs.version, 'dev') }}
           files: |
             dist/*
+            pyapp/*
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

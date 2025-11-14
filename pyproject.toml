@@ -50,3 +50,7 @@ source-includes = [
     "README.md",
     "ebook-toc.png",
 ]
+
+[tool.pyapp]
+name = "ebook-toc"
+entry-point = "ebooktoc.cli:main"
