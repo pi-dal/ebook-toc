@@ -76,6 +76,8 @@ jobs:
         include:
           - os: ubuntu-latest
             os_label: linux
+          - os: ubuntu-22.04-arm
+            os_label: linux
           - os: macos-latest
             os_label: macos
     permissions:
@@ -129,15 +131,12 @@ jobs:
       - name: Build PyApp binary
         run: |
           set -euxo pipefail
-          SDIST=$(ls dist/*.tar.gz | head -n1)
-          mkdir -p src
-          tar -xzf "$SDIST" -C src
-          EXTRACTED_DIR=$(ls src | head -n1)
-          cd "src/$EXTRACTED_DIR"
           ARCH=$(uname -m)
-          OUT="../../dist/ebook-toc-${{ steps.meta.outputs.version }}-${{ matrix.os_label }}-${ARCH}"
-          echo "Building to $OUT"
-          pyapp build -o "$OUT" .
+          OUT="dist/ebook-toc-${{ steps.meta.outputs.version }}-${{ matrix.os_label }}-${ARCH}"
+          echo "Copying PyApp binary to $OUT"
+          mkdir -p dist
+          PYAPP_BIN="$(command -v pyapp)"
+          cp "$PYAPP_BIN" "$OUT"
           chmod +x "$OUT"
 
       - name: Upload PyApp artifact
@@ -223,6 +222,8 @@ jobs:
         include:
           - os: ubuntu-latest
             os_label: linux
+          - os: ubuntu-22.04-arm
+            os_label: linux
           - os: macos-latest
             os_label: macos
     steps:
@@ -260,15 +261,12 @@ jobs:
       - name: Build PyApp binary
         run: |
           set -euxo pipefail
-          SDIST=$(ls dist/*.tar.gz | head -n1)
-          mkdir -p src
-          tar -xzf "$SDIST" -C src
-          EXTRACTED_DIR=$(ls src | head -n1)
-          cd "src/$EXTRACTED_DIR"
           ARCH=$(uname -m)
-          OUT="../../dist/ebook-toc-${{ needs.manual_prepare.outputs.version }}-${{ matrix.os_label }}-${ARCH}"
-          echo "Building to $OUT"
-          pyapp build -o "$OUT" .
+          OUT="dist/ebook-toc-${{ needs.manual_prepare.outputs.version }}-${{ matrix.os_label }}-${ARCH}"
+          echo "Copying PyApp binary to $OUT"
+          mkdir -p dist
+          PYAPP_BIN="$(command -v pyapp)"
+          cp "$PYAPP_BIN" "$OUT"
           chmod +x "$OUT"
 
       - name: Upload PyApp artifact
