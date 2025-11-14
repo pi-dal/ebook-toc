@@ -106,10 +106,20 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Install PyApp
+      - name: Install Rust toolchain (for PyApp)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build PyApp from latest source
         run: |
-          python -m pip install --upgrade pip
-          python -m pip install pyapp
+          set -euxo pipefail
+          PYAPP_TAR=pyapp-source.tar.gz
+          curl -sSfL "https://github.com/ofek/pyapp/releases/latest/download/source.tar.gz" -o "$PYAPP_TAR"
+          mkdir -p pyapp-src
+          tar -xzf "$PYAPP_TAR" -C pyapp-src
+          EXTRACTED_DIR=$(tar -tzf "$PYAPP_TAR" | head -n1 | cut -d/ -f1)
+          cd "pyapp-src/$EXTRACTED_DIR"
+          cargo build --release
+          echo "$(pwd)/target/release" >> "$GITHUB_PATH"
 
       - name: Build PyApp binary
         run: |
@@ -216,10 +226,20 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Install PyApp
+      - name: Install Rust toolchain (for PyApp)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build PyApp from latest source
         run: |
-          python -m pip install --upgrade pip
-          python -m pip install pyapp
+          set -euxo pipefail
+          PYAPP_TAR=pyapp-source.tar.gz
+          curl -sSfL "https://github.com/ofek/pyapp/releases/latest/download/source.tar.gz" -o "$PYAPP_TAR"
+          mkdir -p pyapp-src
+          tar -xzf "$PYAPP_TAR" -C pyapp-src
+          EXTRACTED_DIR=$(tar -tzf "$PYAPP_TAR" | head -n1 | cut -d/ -f1)
+          cd "pyapp-src/$EXTRACTED_DIR"
+          cargo build --release
+          echo "$(pwd)/target/release" >> "$GITHUB_PATH"
 
       - name: Download dist artifact
         uses: actions/download-artifact@v4
