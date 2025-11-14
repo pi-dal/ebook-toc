@@ -78,7 +78,7 @@ jobs:
           python-version: '3.12'
           cache: true
 
-      - name: Normalize and verify version on PyPI
+      - name: Normalize version input
         id: ver
         env:
           INPUT_VERSION: ${{ inputs.version }}
@@ -105,6 +105,9 @@ jobs:
               fh.write(f"normalized={norm}\n")
           print('Normalized version:', norm)
           PY
+
+      - name: Verify version exists on PyPI (enforces PyPI first)
+        run: |
           echo "Verifying version ${{ steps.ver.outputs.normalized }} exists on PyPI..."
           curl -sSfL "https://pypi.org/pypi/ebook-toc/${{ steps.ver.outputs.normalized }}/json" > /dev/null
 
