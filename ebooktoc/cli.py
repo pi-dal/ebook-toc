@@ -11,6 +11,7 @@ from urllib.parse import urlparse
 
 import requests
 from rich.console import Console
+from . import __version__
 
 from .fingerprints import (
     compute_pdf_fingerprints,
@@ -40,7 +41,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--version",
         action="version",
-        version="ebook-toc %(prog)s version 0.1.0",
+        # Use distribution version to avoid drift with pyproject.toml
+        version=f"%(prog)s {__version__}",
     )
 
     subparsers = parser.add_subparsers(dest="command", metavar="COMMAND")

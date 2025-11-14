@@ -1,13 +1,65 @@
 name: Release
 
 on:
-  push:
-    tags:
-      - '*.*.*'
+  workflow_run:
+    workflows: ["Publish to PyPI"]
+    types: ["completed"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to release (e.g. 0.0.1-alpha)"
+        required: true
+        type: string
 
 jobs:
   create_release:
-    name: Create GitHub Release
+    name: Create GitHub Release after PyPI
+    if: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - name: Download dist artifact from previous run
+        uses: dawidd6/action-download-artifact@v3
+        with:
+          run_id: ${{ github.event.workflow_run.id }}
+          name: dist
+          path: dist
+
+      - name: Read version
+        id: meta
+        run: |
+          if [ -f dist/VERSION.txt ]; then
+            VERSION=$(cat dist/VERSION.txt)
+          else
+            echo "VERSION.txt not found; inferring from filenames" >&2
+            VERSION=$(ls dist/*.whl | head -n1 | sed -E 's/.*ebook[_-]toc-([^ -]+)-.*/\1/' || true)
+          fi
+          if [ -f dist/TAG.txt ]; then
+            TAG=$(cat dist/TAG.txt)
+          else
+            TAG="$VERSION"
+          fi
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+          echo "Using normalized version: $VERSION, tag: $TAG"
+
+      - name: Create GitHub Release and upload assets
+        uses: softprops/action-gh-release@v2
+        with:
+          name: ${{ steps.meta.outputs.version }}
+          tag_name: ${{ steps.meta.outputs.tag }}
+          generate_release_notes: true
+          prerelease: ${{ contains(steps.meta.outputs.version, 'a') || contains(steps.meta.outputs.version, 'b') || contains(steps.meta.outputs.version, 'rc') || contains(steps.meta.outputs.version, 'dev') }}
+          files: |
+            dist/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  manual_release:
+    name: Manual GitHub Release
+    if: ${{ github.event_name == 'workflow_dispatch' }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -15,10 +67,80 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Create GitHub Release
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Setup PDM
+        uses: pdm-project/setup-pdm@v4
+        with:
+          python-version: '3.12'
+          cache: true
+
+      - name: Normalize version input
+        id: ver
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          echo "Input version: $INPUT_VERSION"
+          python - <<'PY' "$INPUT_VERSION"
+          import re, sys, os
+          raw = sys.argv[1].lstrip('v')
+          raw = raw.split('+', 1)[0]
+          base, norm = raw, raw
+          if '-' in raw:
+              base, suf = raw.split('-', 1)
+              suf = suf.lower()
+              m = re.match(r'^(alpha|beta|rc|a|b|dev)[\.-]?(\d+)?$', suf)
+              if m:
+                  label, num = m.group(1), m.group(2)
+                  label = {'alpha':'a','beta':'b','rc':'rc','a':'a','b':'b','dev':'dev'}[label]
+                  if num is None:
+                      num = '0'
+                  norm = f"{base}{label}{num}"
+          if not re.match(r'^\d', norm):
+              norm = raw
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as fh:
+              fh.write(f"normalized={norm}\n")
+          print('Normalized version:', norm)
+          PY
+
+      - name: Verify version exists on PyPI (enforces PyPI first)
+        run: |
+          echo "Verifying version ${{ steps.ver.outputs.normalized }} exists on PyPI..."
+          curl -sSfL "https://pypi.org/pypi/ebook-toc/${{ steps.ver.outputs.normalized }}/json" > /dev/null
+
+      - name: Set version in pyproject (normalized)
+        env:
+          VERSION: ${{ steps.ver.outputs.normalized }}
+        run: |
+          python - <<'PY' "$VERSION"
+          import re, sys
+          version = sys.argv[1]
+          path = 'pyproject.toml'
+          with open(path, 'r', encoding='utf-8') as f:
+              content = f.read()
+          new = re.sub(r'(?m)^version\s*=\s*"[^"]+"', f'version = "{version}"', content)
+          with open(path, 'w', encoding='utf-8') as f:
+              f.write(new)
+          print('pyproject.toml version ->', version)
+          PY
+
+      - name: Build artifacts
+        run: |
+          pdm build
+          echo "${{ steps.ver.outputs.normalized }}" > dist/VERSION.txt
+
+      - name: Create GitHub Release and upload assets
         uses: softprops/action-gh-release@v2
         with:
-          name: ${{ github.ref_name }}
+          name: ${{ steps.ver.outputs.normalized }}
+          tag_name: ${{ steps.ver.outputs.normalized }}
+          target_commitish: ${{ github.sha }}
           generate_release_notes: true
+          prerelease: ${{ contains(steps.ver.outputs.normalized, 'a') || contains(steps.ver.outputs.normalized, 'b') || contains(steps.ver.outputs.normalized, 'rc') || contains(steps.ver.outputs.normalized, 'dev') }}
+          files: |
+            dist/*
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
