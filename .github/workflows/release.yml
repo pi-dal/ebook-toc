@@ -116,7 +116,7 @@ jobs:
           curl -sSfL "https://github.com/ofek/pyapp/releases/latest/download/source.tar.gz" -o "$PYAPP_TAR"
           mkdir -p pyapp-src
           tar -xzf "$PYAPP_TAR" -C pyapp-src
-          EXTRACTED_DIR=$(tar -tzf "$PYAPP_TAR" | head -n1 | cut -d/ -f1)
+          EXTRACTED_DIR=$(ls pyapp-src | head -n1)
           cd "pyapp-src/$EXTRACTED_DIR"
           cargo build --release
           echo "$(pwd)/target/release" >> "$GITHUB_PATH"
@@ -127,7 +127,7 @@ jobs:
           SDIST=$(ls dist/*.tar.gz | head -n1)
           mkdir -p src
           tar -xzf "$SDIST" -C src
-          EXTRACTED_DIR=$(tar -tzf "$SDIST" | head -n1 | cut -d/ -f1)
+          EXTRACTED_DIR=$(ls src | head -n1)
           cd "src/$EXTRACTED_DIR"
           ARCH=$(uname -m)
           OUT="../../dist/ebook-toc-${{ steps.meta.outputs.version }}-${{ matrix.os_label }}-${ARCH}"
@@ -236,7 +236,7 @@ jobs:
           curl -sSfL "https://github.com/ofek/pyapp/releases/latest/download/source.tar.gz" -o "$PYAPP_TAR"
           mkdir -p pyapp-src
           tar -xzf "$PYAPP_TAR" -C pyapp-src
-          EXTRACTED_DIR=$(tar -tzf "$PYAPP_TAR" | head -n1 | cut -d/ -f1)
+          EXTRACTED_DIR=$(ls pyapp-src | head -n1)
           cd "pyapp-src/$EXTRACTED_DIR"
           cargo build --release
           echo "$(pwd)/target/release" >> "$GITHUB_PATH"
@@ -253,7 +253,7 @@ jobs:
           SDIST=$(ls dist/*.tar.gz | head -n1)
           mkdir -p src
           tar -xzf "$SDIST" -C src
-          EXTRACTED_DIR=$(tar -tzf "$SDIST" | head -n1 | cut -d/ -f1)
+          EXTRACTED_DIR=$(ls src | head -n1)
           cd "src/$EXTRACTED_DIR"
           ARCH=$(uname -m)
           OUT="../../dist/ebook-toc-${{ needs.manual_prepare.outputs.version }}-${{ matrix.os_label }}-${ARCH}"
