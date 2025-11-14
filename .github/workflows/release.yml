@@ -75,7 +75,9 @@ jobs:
       matrix:
         include:
           - os: ubuntu-latest
-            os_label: linux
+            os_label: linux-x64
+          - os: ubuntu-22.04-arm
+            os_label: linux-arm64
           - os: macos-latest
             os_label: macos
     permissions:
@@ -106,29 +108,43 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Install PyApp
-        run: |
-          python -m pip install --upgrade pip
-          python -m pip install pyapp
+      - name: Install Rust toolchain (for PyApp)
+        uses: dtolnay/rust-toolchain@stable
 
-      - name: Build PyApp binary
+      - name: Build PyApp from latest source
+        env:
+          PYAPP_PROJECT_NAME: ebook-toc
+          PYAPP_PROJECT_VERSION: ${{ steps.meta.outputs.version }}
+          PYAPP_PYTHON_VERSION: "3.13"
+          PYAPP_EXEC_SPEC: "ebooktoc.cli:main"
+          PYAPP_PROJECT_PATH: "../../dist/ebook_toc-${{ steps.meta.outputs.version }}-py3-none-any.whl"
+          PYAPP_DISTRIBUTION_EMBED: "1"
         run: |
           set -euxo pipefail
-          SDIST=$(ls dist/*.tar.gz | head -n1)
-          mkdir -p src
-          tar -xzf "$SDIST" -C src
-          EXTRACTED_DIR=$(tar -tzf "$SDIST" | head -n1 | cut -d/ -f1)
-          cd "src/$EXTRACTED_DIR"
+          PYAPP_TAR=pyapp-source.tar.gz
+          curl -sSfL "https://github.com/ofek/pyapp/releases/latest/download/source.tar.gz" -o "$PYAPP_TAR"
+          mkdir -p pyapp-src
+          tar -xzf "$PYAPP_TAR" -C pyapp-src
+          EXTRACTED_DIR=$(ls pyapp-src | head -n1)
+          cd "pyapp-src/$EXTRACTED_DIR"
+          cargo build --release
+          echo "$(pwd)/target/release" >> "$GITHUB_PATH"
+
+      - name: Copy PyApp binary
+        run: |
+          set -euxo pipefail
           ARCH=$(uname -m)
-          OUT="../../dist/ebook-toc-${{ steps.meta.outputs.version }}-${{ matrix.os_label }}-${ARCH}"
-          echo "Building to $OUT"
-          pyapp build -o "$OUT" .
+          OUT="dist/ebook-toc-${{ steps.meta.outputs.version }}-${{ matrix.os_label }}-${ARCH}"
+          echo "Copying PyApp binary to $OUT"
+          mkdir -p dist
+          PYAPP_BIN="$(command -v pyapp)"
+          cp "$PYAPP_BIN" "$OUT"
           chmod +x "$OUT"
 
       - name: Upload PyApp artifact
         uses: actions/upload-artifact@v4
         with:
-          name: pyapp-${{ matrix.os_label }}
+          name: pyapp-${{ matrix.os_label }}-${{ runner.arch }}
           path: dist/ebook-toc-${{ steps.meta.outputs.version }}-${{ matrix.os_label }}-*
 
   manual_prepare:
@@ -207,7 +223,9 @@ jobs:
       matrix:
         include:
           - os: ubuntu-latest
-            os_label: linux
+            os_label: linux-x64
+          - os: ubuntu-22.04-arm
+            os_label: linux-arm64
           - os: macos-latest
             os_label: macos
     steps:
@@ -216,10 +234,8 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Install PyApp
-        run: |
-          python -m pip install --upgrade pip
-          python -m pip install pyapp
+      - name: Install Rust toolchain (for PyApp)
+        uses: dtolnay/rust-toolchain@stable
 
       - name: Download dist artifact
         uses: actions/download-artifact@v4
@@ -227,24 +243,40 @@ jobs:
           name: dist
           path: dist
 
-      - name: Build PyApp binary
+      - name: Build PyApp from latest source
+        env:
+          PYAPP_PROJECT_NAME: ebook-toc
+          PYAPP_PROJECT_VERSION: ${{ needs.manual_prepare.outputs.version }}
+          PYAPP_PYTHON_VERSION: "3.13"
+          PYAPP_EXEC_SPEC: "ebooktoc.cli:main"
+          PYAPP_PROJECT_PATH: "../../dist/ebook_toc-${{ needs.manual_prepare.outputs.version }}-py3-none-any.whl"
+          PYAPP_DISTRIBUTION_EMBED: "1"
         run: |
           set -euxo pipefail
-          SDIST=$(ls dist/*.tar.gz | head -n1)
-          mkdir -p src
-          tar -xzf "$SDIST" -C src
-          EXTRACTED_DIR=$(tar -tzf "$SDIST" | head -n1 | cut -d/ -f1)
-          cd "src/$EXTRACTED_DIR"
+          PYAPP_TAR=pyapp-source.tar.gz
+          curl -sSfL "https://github.com/ofek/pyapp/releases/latest/download/source.tar.gz" -o "$PYAPP_TAR"
+          mkdir -p pyapp-src
+          tar -xzf "$PYAPP_TAR" -C pyapp-src
+          EXTRACTED_DIR=$(ls pyapp-src | head -n1)
+          cd "pyapp-src/$EXTRACTED_DIR"
+          cargo build --release
+          echo "$(pwd)/target/release" >> "$GITHUB_PATH"
+
+      - name: Copy PyApp binary
+        run: |
+          set -euxo pipefail
           ARCH=$(uname -m)
-          OUT="../../dist/ebook-toc-${{ needs.manual_prepare.outputs.version }}-${{ matrix.os_label }}-${ARCH}"
-          echo "Building to $OUT"
-          pyapp build -o "$OUT" .
+          OUT="dist/ebook-toc-${{ needs.manual_prepare.outputs.version }}-${{ matrix.os_label }}-${ARCH}"
+          echo "Copying PyApp binary to $OUT"
+          mkdir -p dist
+          PYAPP_BIN="$(command -v pyapp)"
+          cp "$PYAPP_BIN" "$OUT"
           chmod +x "$OUT"
 
       - name: Upload PyApp artifact
         uses: actions/upload-artifact@v4
         with:
-          name: pyapp-${{ matrix.os_label }}
+          name: pyapp-${{ matrix.os_label }}-${{ runner.arch }}
           path: dist/ebook-toc-${{ needs.manual_prepare.outputs.version }}-${{ matrix.os_label }}-*
 
   manual_release:
