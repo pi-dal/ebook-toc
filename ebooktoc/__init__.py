@@ -22,7 +22,7 @@ except _md.PackageNotFoundError:  # pragma: no cover - dev-only path
         from pathlib import Path
 
         pyproject = Path(__file__).resolve().parent.parent / "pyproject.toml"
-        m = re.search(r'(?m)^version\s*=\s*"([^"]+)"', pyproject.read_text(encoding="utf-8"))
-        __version__ = m.group(1) if m else "0.0.0"
+        m = re.search(r'(?m)^version\s*=\s*(["\'])(.*?)\1', pyproject.read_text(encoding="utf-8"))
+        __version__ = m.group(2) if m else "0.0.0"
     except OSError:
         __version__ = "0.0.0"
