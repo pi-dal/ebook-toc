@@ -114,6 +114,7 @@ jobs:
           PYAPP_PROJECT_NAME: ebook-toc
           PYAPP_PROJECT_VERSION: ${{ steps.meta.outputs.version }}
           PYAPP_PYTHON_VERSION: "3.13"
+          PYAPP_EXEC_SPEC: "ebooktoc.cli:main"
         run: |
           set -euxo pipefail
           PYAPP_TAR=pyapp-source.tar.gz
@@ -238,6 +239,7 @@ jobs:
           PYAPP_PROJECT_NAME: ebook-toc
           PYAPP_PROJECT_VERSION: ${{ needs.manual_prepare.outputs.version }}
           PYAPP_PYTHON_VERSION: "3.13"
+          PYAPP_EXEC_SPEC: "ebooktoc.cli:main"
         run: |
           set -euxo pipefail
           PYAPP_TAR=pyapp-source.tar.gz
