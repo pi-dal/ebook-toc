@@ -62,7 +62,7 @@ jobs:
           prerelease: ${{ contains(steps.meta.outputs.version, 'a') || contains(steps.meta.outputs.version, 'b') || contains(steps.meta.outputs.version, 'rc') || contains(steps.meta.outputs.version, 'dev') }}
           files: |
             dist/*
-            pyapp/*
+            pyapp/**
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
@@ -294,6 +294,6 @@ jobs:
           prerelease: ${{ contains(needs.manual_prepare.outputs.version, 'a') || contains(needs.manual_prepare.outputs.version, 'b') || contains(needs.manual_prepare.outputs.version, 'rc') || contains(needs.manual_prepare.outputs.version, 'dev') }}
           files: |
             dist/*
-            pyapp/*
+            pyapp/**
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
