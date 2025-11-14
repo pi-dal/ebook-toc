@@ -79,7 +79,7 @@ jobs:
           - os: macos-latest
             os_label: macos
     permissions:
-      actions: read
+      actions: write
       contents: read
     steps:
       - name: Download dist artifact from previous run
