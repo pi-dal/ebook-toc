@@ -124,8 +124,8 @@ def build_parser() -> argparse.ArgumentParser:
     scan_parser.add_argument(
         "--batch-size",
         type=int,
-        default=3,
-        help="Number of pages to send per SiliconFlow request (default: 3).",
+        default=10,
+        help="Number of pages to send per SiliconFlow request (default: 10).",
     )
     scan_parser.add_argument(
         "--save-json",
@@ -1090,17 +1090,49 @@ def _scan_with_adaptive_pages(
     upper_bound = max_pages if max_pages > 0 else None
     should_expand = auto_expand and current_limit > 0
 
+    # Track cumulative results across incremental batches so that when a TOC
+    # appears in a later window we still return earlier candidates.
+    cumulative_entries: list[dict[str, Any]] = []
+    cumulative_fingerprints: list[dict[str, Any]] = []
     page_offset: Optional[int] = None
 
+    previous_limit = 0
+
+    from .toc_parser import infer_missing_targets
+
     while True:
+        # When current_limit is 0, we scan the entire document in a single call,
+        # preserving the existing "scan all pages" behaviour.
+        if current_limit == 0:
+            start_page = 1
+            window_size = 0
+        else:
+            start_page = previous_limit + 1
+            window_size = current_limit - previous_limit
+            if window_size <= 0:
+                # Nothing new to scan; avoid an infinite loop.
+                return (
+                    infer_missing_targets(
+                        filter_entries(
+                            deduplicate_entries(cumulative_entries),
+                            contains=contains,
+                            pattern=pattern,
+                        )
+                    ),
+                    current_limit,
+                    page_offset,
+                    cumulative_fingerprints,
+                )
+
         json_path = fetch_document_json(
             pdf_path,
             api_key,
             poll_interval=poll_interval,
             timeout=timeout,
-            page_limit=current_limit,
+            page_limit=window_size,
             remote_url=remote_url,
             batch_size=batch_size,
+            start_page=start_page,
         )
 
         try:
@@ -1108,46 +1140,54 @@ def _scan_with_adaptive_pages(
         finally:
             Path(json_path).unlink(missing_ok=True)
 
-        fingerprints: list[dict[str, Any]] = []
+        batch_fingerprints: list[dict[str, Any]] = []
         if isinstance(raw_data, dict) and "toc" in raw_data:
             entries_data = raw_data.get("toc")
             raw_offset = raw_data.get("page_offset")
             try:
-                page_offset = int(raw_offset)
+                batch_offset = int(raw_offset)
             except (TypeError, ValueError, OverflowError):
-                page_offset = None
+                batch_offset = None
+            if batch_offset is not None:
+                page_offset = batch_offset
             fps = raw_data.get("fingerprints")
             if isinstance(fps, list):
-                fingerprints = fps
+                batch_fingerprints = fps
         else:
             entries_data = raw_data
 
-        entries = extract_toc_entries(entries_data)
-        entries = deduplicate_entries(entries)
-        entries = filter_entries(entries, contains=contains, pattern=pattern)
-        # Try to infer missing target pages from content when VLM omitted them
-        from .toc_parser import infer_missing_targets
-        entries = infer_missing_targets(entries)
+        # Accumulate entries and fingerprints from this batch into the running
+        # collections so we can deduplicate and filter across all scanned pages.
+        batch_entries = extract_toc_entries(entries_data)
+        cumulative_entries.extend(batch_entries)
+        cumulative_fingerprints.extend(batch_fingerprints)
 
-        if entries:
-            return entries, current_limit, page_offset, fingerprints
+        processed_entries = deduplicate_entries(cumulative_entries)
+        processed_entries = filter_entries(
+            processed_entries,
+            contains=contains,
+            pattern=pattern,
+        )
+        processed_entries = infer_missing_targets(processed_entries)
+
+        if processed_entries:
+            return processed_entries, current_limit, page_offset, cumulative_fingerprints
 
         if not should_expand:
-            return entries, current_limit, page_offset, fingerprints
+            return processed_entries, current_limit, page_offset, cumulative_fingerprints
 
         next_limit = current_limit + effective_step
         if upper_bound is not None:
             next_limit = min(next_limit, upper_bound)
 
         if next_limit == current_limit:
-            return entries, current_limit, page_offset, fingerprints
+            return processed_entries, current_limit, page_offset, cumulative_fingerprints
 
         console.print(
             f"[yellow]未找到目录，扩展扫描页数到 {next_limit} 页 (批量 {batch_size})...[/]"
         )
+        previous_limit = current_limit
         current_limit = next_limit
-
-    return [], current_limit, page_offset, []
 
 
 def _run_help(args: argparse.Namespace) -> None:

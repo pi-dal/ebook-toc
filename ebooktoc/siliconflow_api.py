@@ -7,6 +7,7 @@ import concurrent.futures
 import json
 import tempfile
 import threading
+import time
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
@@ -43,6 +44,7 @@ def fetch_document_json(
     task_id: Optional[str] = None,
     *,
     batch_size: int = DEFAULT_BATCH_SIZE,
+    start_page: int = 1,
 ) -> Path:
     """Extract TOC data using SiliconFlow's Qwen/Qwen3-VL-32B-Instruct model.
 
@@ -54,19 +56,51 @@ def fetch_document_json(
 
     source_path, cleanup_required = _resolve_source_pdf(pdf_path, remote_url)
     try:
-        page_payloads, fingerprints = _collect_page_payloads(source_path, page_limit)
+        page_payloads, fingerprints = _collect_page_payloads(
+            source_path, page_limit, start_page=start_page
+        )
         aggregated: List[Dict[str, Any]] = []
 
         effective_batch = max(1, batch_size)
-        for batch_index, batch in enumerate(
-            _chunk_iterable(page_payloads, effective_batch), start=1
-        ):
-            payload = _build_payload(batch, page_limit)
-            response_body = _call_chat_completion(
-                api_key, payload, request_timeout=timeout
-            )
-            toc_json = _parse_response_payload(response_body)
-            aggregated.extend(toc_json)
+        batches: List[List[Dict[str, Any]]] = list(
+            _chunk_iterable(page_payloads, effective_batch)
+        )
+
+        if batches:
+            max_attempts = 3
+
+            def _fetch_toc_for_batch(
+                batch: List[Dict[str, Any]]
+            ) -> List[Dict[str, Any]]:
+                attempts = 0
+                last_error: Optional[Exception] = None
+                while attempts < max_attempts:
+                    attempts += 1
+                    payload = _build_payload(
+                        batch, page_limit, start_page=start_page
+                    )
+                    try:
+                        response_body = _call_chat_completion(
+                            api_key, payload, request_timeout=timeout
+                        )
+                        return _parse_response_payload(response_body)
+                    except TOCExtractionError as exc:
+                        last_error = exc
+                        if attempts >= max_attempts or not _is_retryable_error(exc):
+                            raise
+                        # Simple exponential backoff capped at 5 seconds
+                        sleep_seconds = min(2 ** (attempts - 1), 5)
+                        time.sleep(sleep_seconds)
+
+                # Should not be reached because we either return or raise above
+                if last_error is not None:
+                    raise last_error
+                return []
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
+                for toc_json in executor.map(_fetch_toc_for_batch, batches):
+                    aggregated.extend(toc_json)
+
         offset = None
         try:
             offset = _infer_page_offset(
@@ -120,7 +154,12 @@ def _download_remote_pdf(url: str) -> Path:
         raise TOCExtractionError(f"Failed to download remote PDF: {exc}") from exc
 
 
-def _collect_page_payloads(pdf_path: Path, max_pages: int) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+def _collect_page_payloads(
+    pdf_path: Path,
+    max_pages: int,
+    *,
+    start_page: int = 1,
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     try:
         import fitz  # type: ignore[import]
     except ImportError as exc:  # pragma: no cover - dependency issue
@@ -135,14 +174,25 @@ def _collect_page_payloads(pdf_path: Path, max_pages: int) -> Tuple[List[Dict[st
     if total_pages == 0:
         raise TOCExtractionError("PDF contains no pages")
 
-    end_page = total_pages if max_pages <= 0 else min(max_pages, total_pages)
+    # Convert 1-based start_page to 0-based index and clamp at 0
+    start_index = max(0, start_page - 1)
+    if max_pages <= 0:
+        end_page = total_pages
+    else:
+        end_page = min(total_pages, start_index + max_pages)
+
+    # When the requested window lies entirely past the end of the document,
+    # treat this as "no pages left to scan" rather than a hard failure.
+    if start_index >= end_page:
+        return [], []
+
     payloads: List[Dict[str, Any]] = []
     fingerprints: List[Dict[str, Any]] = []
 
     with concurrent.futures.ThreadPoolExecutor() as executor:
         futures = [
             executor.submit(_get_or_render_page_payload, resolved, index)
-            for index in range(end_page)
+            for index in range(start_index, end_page)
         ]
 
         for future in futures:
@@ -160,7 +210,11 @@ def _collect_page_payloads(pdf_path: Path, max_pages: int) -> Tuple[List[Dict[st
     return payloads, fingerprints
 
 
-def _build_payload(page_payloads: List[Dict[str, Any]], max_pages: int) -> Dict[str, Any]:
+def _build_payload(
+    page_payloads: List[Dict[str, Any]],
+    max_pages: int,
+    start_page: int = 1,
+) -> Dict[str, Any]:
     instructions = (
         "You are an assistant that extracts a book's table of contents from PDF content. "
         "For every TOC line, output an object with keys: "
@@ -173,9 +227,20 @@ def _build_payload(page_payloads: List[Dict[str, Any]], max_pages: int) -> Dict[
         "If no TOC entries are present, respond with {\"toc\": []}."
     )
 
-    range_label = max_pages if max_pages > 0 else "all"
+    if max_pages <= 0:
+        if start_page <= 1:
+            range_label = "the entire document"
+        else:
+            range_label = f"pages {start_page} and later"
+    else:
+        if start_page <= 1:
+            range_label = f"the first {max_pages} pages"
+        else:
+            end_page = start_page + max_pages - 1
+            range_label = f"pages {start_page} to {end_page}"
+
     intro_text = (
-        f"The following content comes from the first {range_label} pages of a PDF. Each section begins "
+        f"The following content comes from {range_label} of a PDF. Each section begins "
         "with a header like [Page 4]. Analyze the provided text or image for each section, identify "
         "the table-of-contents entries, and extract the title along with any target page number mentioned "
         "in the line. Return JSON exactly as described."
@@ -250,6 +315,15 @@ def _call_chat_completion(
     if not isinstance(body, dict):
         raise TOCExtractionError("Unexpected SiliconFlow response format")
     return body
+
+
+def _is_retryable_error(exc: TOCExtractionError) -> bool:
+    cause = exc.__cause__
+    if isinstance(cause, requests.HTTPError) and cause.response is not None:
+        status = cause.response.status_code
+        if status == 429 or 500 <= status < 600:
+            return True
+    return False
 
 
 def _parse_response_payload(body: Dict[str, Any]) -> List[Dict[str, Any]]:
