@@ -340,7 +340,18 @@ def _parse_response_payload(body: Dict[str, Any]) -> List[Dict[str, Any]]:
     try:
         data = json.loads(json_text)
     except json.JSONDecodeError as exc:
-        raise TOCExtractionError(f"Failed to parse SiliconFlow JSON output: {exc}\nRaw: {json_text}") from exc
+        # Best-effort repair for slightly invalid JSON coming back from the model.
+        # In practice we sometimes see unquoted or single-quoted keys like
+        #   {page: 11, target_page: 67, content: "Title"}
+        # even though the response is supposed to be strict JSON. When this happens
+        # we attempt to quote the known keys and parse again; if that still fails we
+        # surface the original error.
+        repaired = _repair_toc_json(json_text)
+        if repaired is None:
+            raise TOCExtractionError(
+                f"Failed to parse SiliconFlow JSON output: {exc}\nRaw: {json_text}"
+            ) from exc
+        data = repaired
 
     toc: Any
     if isinstance(data, dict):
@@ -348,6 +359,12 @@ def _parse_response_payload(body: Dict[str, Any]) -> List[Dict[str, Any]]:
             toc = data["toc"]
         elif "output" in data and isinstance(data["output"], list):
             toc = data["output"]
+        # Some SiliconFlow responses occasionally return a single TOC-like
+        # object instead of wrapping it in a {\"toc\": [...]} container.
+        # When we see a mapping that looks like one TOC entry, treat it as a
+        # singleton list rather than failing hard.
+        elif "page" in data and "content" in data:
+            toc = [data]
         else:
             raise TOCExtractionError(
                 f"SiliconFlow response missing 'toc' key: {json_text}"
@@ -379,21 +396,154 @@ def _extract_json_block(text: str) -> str:
 
 
 def _find_json_substring(text: str) -> Optional[str]:
+    """Return the first JSON object/array substring found in text.
+
+    This implementation is tolerant of leading/trailing commentary and avoids
+    being confused by brackets that appear inside string literals by delegating
+    to the JSON decoder's raw_decode at different candidate offsets.
+    """
     decoder = json.JSONDecoder()
-    for opener, closer in (("[", "]"), ("{", "}")):
-        start = text.find(opener)
-        end = text.rfind(closer)
-        if start == -1 or end == -1 or end <= start:
+
+    # Fast path: the whole string (after trimming) is valid JSON.
+    stripped = text.strip()
+    try:
+        _, end = decoder.raw_decode(stripped)
+        return stripped[:end]
+    except json.JSONDecodeError:
+        pass
+
+    # General path: search for the first plausible JSON opener and let
+    # raw_decode determine where the JSON payload ends.
+    for idx, ch in enumerate(text):
+        if ch not in "[{":
             continue
-        snippet = text[start : end + 1]
         try:
-            decoder.decode(snippet)
+            _, end = decoder.raw_decode(text[idx:])
         except json.JSONDecodeError:
             continue
-        return snippet
+        return text[idx : idx + end]
+
+    return None
+
+
+def _repair_toc_json(json_text: str) -> Optional[Any]:
+    """Best-effort repair for slightly invalid TOC JSON.
+
+    SiliconFlow is instructed (and configured via response_format) to return
+    strict JSON, but in practice the model may occasionally emit structures
+    with unquoted or single-quoted keys such as:
+
+        {page: 11, target_page: 67, content: "Title"}
+        {'page': 11, 'content': "Title"}
+
+    This helper walks the string outside of double-quoted regions and
+    rewrites the known TOC-related keys (\"toc\", \"page\", \"target_page\",
+    \"content\") into properly double-quoted JSON keys. If parsing still fails
+    we give up and let the caller surface the original error.
+    """
+
+    keys = ("toc", "page", "target_page", "content")
+    result: List[str] = []
+    in_string = False
+    escape = False
+    i = 0
+    length = len(json_text)
+
+    while i < length:
+        ch = json_text[i]
+
+        if in_string:
+            result.append(ch)
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_string = False
+            i += 1
+            continue
+
+        if ch == '"':
+            in_string = True
+            result.append(ch)
+            i += 1
+            continue
+
+        # Handle single-quoted keys like 'page': 1
+        if ch == "'":
+            matched = False
+            for key in keys:
+                key_len = len(key)
+                start = i + 1
+                end = start + key_len
+                if end > length:
+                    continue
+                if json_text[start:end] != key:
+                    continue
+                # Require a closing single quote immediately after the key
+                if end >= length or json_text[end] != "'":
+                    continue
+                # Require a colon after optional whitespace
+                j = end + 1
+                while j < length and json_text[j].isspace():
+                    j += 1
+                if j >= length or json_text[j] != ":":
+                    continue
+
+                # Rewrite 'key' as "key"
+                result.append('"')
+                result.append(key)
+                result.append('"')
+                i = end + 1
+                matched = True
+                break
+
+            if matched:
+                continue
+
+            # Not a recognized key pattern; keep the single quote as-is.
+            result.append(ch)
+            i += 1
+            continue
+
+        # Handle bare keys like page: 1 or target_page: 2
+        if ch.isalpha():
+            matched = False
+            for key in keys:
+                key_len = len(key)
+                end = i + key_len
+                if end > length or json_text[i:end] != key:
+                    continue
+                # Ensure we are not in the middle of a longer identifier
+                before = json_text[i - 1] if i > 0 else ""
+                after = json_text[end] if end < length else ""
+                if before.isalnum() or before == "_" or after.isalnum() or after == "_":
+                    continue
+
+                # Require a colon after optional whitespace
+                j = end
+                while j < length and json_text[j].isspace():
+                    j += 1
+                if j >= length or json_text[j] != ":":
+                    continue
+
+                # Rewrite key as "key"
+                result.append('"')
+                result.append(key)
+                result.append('"')
+                i = end
+                matched = True
+                break
+
+            if matched:
+                continue
+
+        result.append(ch)
+        i += 1
+
+    fixed = "".join(result)
     try:
-        decoder.decode(text)
-        return text
+        return json.loads(fixed)
     except json.JSONDecodeError:
         return None
 
