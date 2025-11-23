@@ -20,7 +20,12 @@ from .fingerprints import (
 )
 from .pdf_writer import write_pdf_toc
 from .siliconflow_api import TOCExtractionError, fetch_document_json, _infer_page_offset
-from .toc_parser import deduplicate_entries, extract_toc_entries, filter_entries
+from .toc_parser import (
+    deduplicate_entries,
+    extract_toc_entries,
+    filter_entries,
+    infer_missing_targets,
+)
 from .utils import (
     dump_json,
     ensure_file,
@@ -709,7 +714,6 @@ def _run_apply(args: argparse.Namespace) -> None:
     saved_clean_map: Dict[int, int] = {}
     if isinstance(raw_data, dict) and "toc" in raw_data:
         entries = extract_toc_entries(raw_data.get("toc"))
-        from .toc_parser import infer_missing_targets
         entries = infer_missing_targets(entries)
         page_offset = _coerce_positive_int(raw_data.get("page_offset"))
         stored_fps = raw_data.get("fingerprints")
@@ -729,7 +733,6 @@ def _run_apply(args: argparse.Namespace) -> None:
             saved_clean_map = tmp
     else:
         entries = extract_toc_entries(raw_data)
-        from .toc_parser import infer_missing_targets
         entries = infer_missing_targets(entries)
         page_offset = None
 
@@ -1097,8 +1100,6 @@ def _scan_with_adaptive_pages(
     page_offset: Optional[int] = None
 
     previous_limit = 0
-
-    from .toc_parser import infer_missing_targets
 
     while True:
         # When current_limit is 0, we scan the entire document in a single call,

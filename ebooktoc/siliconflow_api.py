@@ -48,7 +48,35 @@ def fetch_document_json(
 ) -> Path:
     """Extract TOC data using SiliconFlow's Qwen/Qwen3-VL-32B-Instruct model.
 
-    Returns a temporary JSON file path containing the model output.
+    Parameters
+    ----------
+    pdf_path :
+        Local PDF path when ``remote_url`` is not provided.
+    api_key :
+        SiliconFlow API token.
+    poll_interval, timeout :
+        Retained for CLI compatibility; not used by the SiliconFlow workflow.
+    page_limit :
+        Maximum number of pages to scan from the requested window. A value of
+        ``0`` means \"from ``start_page`` to the end of the document\".
+    remote_url :
+        Optional remote PDF URL to download before scanning. When supplied,
+        ``pdf_path`` is ignored.
+    task_id :
+        Not supported by this workflow; passing a value raises
+        :class:`TOCExtractionError`.
+    batch_size :
+        Number of page payloads to include in each chat completion request.
+    start_page :
+        1-based starting page for the scan window. Callers can advance this
+        between invocations to implement incremental or windowed scanning.
+
+    Returns
+    -------
+    Path
+        Path to a temporary JSON file containing the model output. The JSON
+        object includes at least ``\"toc\"``, ``\"page_offset\"``,
+        ``\"fingerprints\"``, and ``\"page_map\"`` keys.
     """
 
     if task_id is not None:
@@ -95,7 +123,9 @@ def fetch_document_json(
                 # Should not be reached because we either return or raise above
                 if last_error is not None:
                     raise last_error
-                return []
+                raise RuntimeError(
+                    "Unexpected code path reached in _fetch_toc_for_batch"
+                )
 
             with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
                 for toc_json in executor.map(_fetch_toc_for_batch, batches):
@@ -117,7 +147,16 @@ def fetch_document_json(
         page_map: Dict[int, int] = {}
         dims = dominant_dimensions(fingerprints) if fingerprints else None
         if dims:
-            page_map = build_canonical_map_for_dims(fingerprints, dims)
+            raw_map = build_canonical_map_for_dims(fingerprints, dims)
+            # When scanning from a non-first page, fingerprints only cover a
+            # window of the document. Adjust the pdf_page values so they are
+            # expressed in absolute 1-based page numbers rather than
+            # window-relative indices.
+            if start_page > 1 and raw_map:
+                offset = start_page - 1
+                page_map = {canon: page + offset for canon, page in raw_map.items()}
+            else:
+                page_map = raw_map
 
         packaged = {
             "toc": aggregated,
@@ -160,6 +199,22 @@ def _collect_page_payloads(
     *,
     start_page: int = 1,
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Collect payloads and fingerprints for a window of PDF pages.
+
+    The window is defined by a 1-based ``start_page`` and a maximum number of
+    pages ``max_pages``. If ``max_pages`` is less than or equal to zero, all
+    pages from ``start_page`` to the end of the document are considered. When
+    the requested window lies entirely past the end of the document, this
+    function returns empty lists instead of raising an error so callers can
+    treat it as "no pages left to scan".
+
+    Raises
+    ------
+    TOCExtractionError
+        If the PDF cannot be opened, contains no pages, or there are pages in
+        the requested window but none can be extracted (no text or renderable
+        images).
+    """
     try:
         import fitz  # type: ignore[import]
     except ImportError as exc:  # pragma: no cover - dependency issue
@@ -215,6 +270,30 @@ def _build_payload(
     max_pages: int,
     start_page: int = 1,
 ) -> Dict[str, Any]:
+    """Build the chat-completion payload for a window of pages.
+
+    Parameters
+    ----------
+    page_payloads :
+        List of per-page payload dictionaries produced by
+        :func:`_collect_page_payloads` (each containing either ``\"text\"`` or
+        ``\"image_b64\"``, plus a 1-based ``\"page\"`` number).
+    max_pages :
+        Maximum number of pages described by this prompt. When ``max_pages``
+        is less than or equal to zero, the prompt is phrased as covering all
+        pages from ``start_page`` onward.
+    start_page :
+        1-based starting page of the logical window being described to the
+        model. This is used only for prompt wording (for example, to say
+        \"pages 11 to 20\") and should match the window used when collecting
+        ``page_payloads``.
+
+    Returns
+    -------
+    Dict[str, Any]
+        The payload dictionary to send to the SiliconFlow chat completions
+        API, including system instructions and structured user content.
+    """
     instructions = (
         "You are an assistant that extracts a book's table of contents from PDF content. "
         "For every TOC line, output an object with keys: "
@@ -323,6 +402,9 @@ def _is_retryable_error(exc: TOCExtractionError) -> bool:
         status = cause.response.status_code
         if status == 429 or 500 <= status < 600:
             return True
+    # Treat common transient network failures as retryable as well.
+    if isinstance(cause, (requests.Timeout, requests.ConnectionError)):
+        return True
     return False
 
 
