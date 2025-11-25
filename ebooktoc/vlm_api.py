@@ -14,6 +14,7 @@ import tempfile
 import threading
 import time
 from collections import OrderedDict
+from collections.abc import MutableMapping
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
@@ -42,34 +43,50 @@ DEFAULT_DPI_SCALE = 1.5
 MAX_IMAGE_DIMENSION = 2048
 
 
-class LRUCache(OrderedDict):
+class LRUCache(MutableMapping):
     """Simple size-bounded LRU cache.
 
-    This cache preserves insertion order and evicts the least recently used
-    key when ``maxsize`` is exceeded. It is intended for small in-memory
-    caches such as rendered page payloads.
+    The cache stores items in insertion order and moves entries to the end
+    when they are accessed. When ``maxsize`` is exceeded, the least recently
+    used entry is evicted.
     """
 
     def __init__(self, maxsize: int = DEFAULT_CACHE_SIZE) -> None:
-        super().__init__()
         self.maxsize = maxsize
+        self._data: OrderedDict[Any, Any] = OrderedDict()
 
-    def __getitem__(self, key: Any) -> Any:  # type: ignore[override]
-        value = super().__getitem__(key)
-        self.move_to_end(key)
+    def __getitem__(self, key: Any) -> Any:
+        value = self._data[key]
+        self._data.move_to_end(key)
         return value
 
-    def get(self, key: Any, default: Any = None) -> Any:  # type: ignore[override]
-        if key in self:
-            return self[key]
-        return default
+    def __setitem__(self, key: Any, value: Any) -> None:
+        if key in self._data:
+            self._data.move_to_end(key)
+        self._data[key] = value
+        if len(self._data) > self.maxsize:
+            self._data.popitem(last=False)
 
-    def __setitem__(self, key: Any, value: Any) -> None:  # type: ignore[override]
-        if key in self:
-            self.move_to_end(key)
-        super().__setitem__(key, value)
-        if len(self) > self.maxsize:
-            self.popitem(last=False)
+    def __delitem__(self, key: Any) -> None:
+        del self._data[key]
+
+    def __iter__(self):
+        return iter(self._data)
+
+    def __len__(self) -> int:
+        return len(self._data)
+
+    def clear(self) -> None:
+        self._data.clear()
+
+    def get(self, key: Any, default: Any = None) -> Any:
+        try:
+            return self[key]
+        except KeyError:
+            return default
+
+    def __repr__(self) -> str:  # pragma: no cover - cosmetic
+        return f"{self.__class__.__name__}({list(self._data.items())})"
 
 
 # Cache maps (pdf_path, index) -> (payload_entry, fingerprint_dict)
@@ -125,7 +142,7 @@ def fetch_document_json(
     api_base: str | None = None,
     model: str | None = None,
     max_workers: int = 3,
-    progress_callback: Callable[[int, int, int], None] | None = None,
+    progress_callback: Callable[[int, int, str], None] | None = None,
 ) -> Path:
     """Extract TOC data using an OpenAI-format VLM API (default: SiliconFlow Qwen).
 
@@ -199,14 +216,16 @@ def fetch_document_json(
                         last_error = exc
                         if attempts >= max_attempts or not _is_retryable_error(exc):
                             raise
-                        try:
-                            from .cli import console  # local import to avoid cycle
-                        except Exception:
-                            console = None  # type: ignore[assignment]
-                        if console is not None:
-                            console.print(
-                                f"[yellow]Batch {batch_index + 1}/{len(batches)} retry {attempts}/{max_attempts}...[/]"
+                        if progress_callback is not None:
+                            status = (
+                                f"Batch {batch_index + 1}/{len(batches)} retry "
+                                f"{attempts}/{max_attempts}..."
                             )
+                            try:
+                                progress_callback(batch_index, len(batches), status)
+                            except Exception:
+                                # Progress updates are best-effort only.
+                                pass
                         # Simple exponential backoff capped at 5 seconds
                         sleep_seconds = min(2 ** (attempts - 1), 5)
                         time.sleep(sleep_seconds)
@@ -231,8 +250,13 @@ def fetch_document_json(
                     aggregated.extend(toc_json)
                     completed_batches += 1
                     if progress_callback is not None:
+                        status = f"Entries: {len(aggregated)}"
                         try:
-                            progress_callback(completed_batches, len(batches), len(aggregated))
+                            progress_callback(
+                                completed_batches,
+                                len(batches),
+                                status,
+                            )
                         except Exception:
                             # Progress updates are best-effort only.
                             pass

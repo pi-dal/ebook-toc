@@ -5,13 +5,23 @@ from __future__ import annotations
 import argparse
 import re
 import sys
+import time
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
 import requests
 from rich.console import Console
-from rich.progress import BarColumn, Progress, SpinnerColumn, TextColumn
+from .progress import (
+    ProgressReporter,
+    TimingReport,
+    create_progress,
+    format_duration,
+    is_interactive,
+    print_step_complete,
+    timed_progress,
+    timed_step,
+)
 from . import __version__
 
 from .fingerprints import (
@@ -311,6 +321,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def _run_scan(args: argparse.Namespace) -> None:
+    report = TimingReport()
     sources_selected = sum(1 for option in (args.remote_url, args.pdf) if option)
     if sources_selected == 0:
         console.print("[red]Provide a PDF path or --remote-url.[/]")
@@ -390,7 +401,26 @@ def _run_scan(args: argparse.Namespace) -> None:
                 raise SystemExit(1)
 
             try:
-                fps0, _ = compute_pdf_fingerprints(original_pdf_for_output)
+                if is_interactive():
+                    with create_progress("Computing fingerprints for GoodNotes...", total=None) as (
+                        progress,
+                        task_id,
+                    ):
+                        reporter = ProgressReporter(progress, task_id)
+
+                        def _fp_cb(done: int, total: int) -> None:
+                            reporter(
+                                done,
+                                total,
+                                f"Computing fingerprints... {done}/{total} pages",
+                            )
+
+                        fps0, _ = compute_pdf_fingerprints(
+                            original_pdf_for_output,
+                            progress_callback=_fp_cb,
+                        )
+                else:
+                    fps0, _ = compute_pdf_fingerprints(original_pdf_for_output)
             except Exception:
                 fps0 = []
             dims0 = dominant_dimensions(fps0) if fps0 else None
@@ -426,6 +456,7 @@ def _run_scan(args: argparse.Namespace) -> None:
                 f"📖 Scanning entire document to detect TOC (batch size {args.batch_size})..."
             )
 
+        scan_start = time.perf_counter()
         final_entries, used_limit, page_offset, fingerprints = _scan_with_adaptive_pages(
             api_key=args.api_key,
             pdf_path=scan_pdf,
@@ -442,6 +473,13 @@ def _run_scan(args: argparse.Namespace) -> None:
             max_workers=args.max_workers,
             api_base=args.api_base,
             model=args.model,
+        )
+        scan_elapsed = time.perf_counter() - scan_start
+        scanned_pages = "all" if used_limit == 0 else str(used_limit)
+        report.add(
+            "VLM scanning",
+            scan_elapsed,
+            f"{scanned_pages} pages, {len(final_entries)} entries",
         )
     except TOCExtractionError as err:
         console.print(f"[red]{err}[/]")
@@ -465,6 +503,12 @@ def _run_scan(args: argparse.Namespace) -> None:
     pages_label = "全部" if used_limit == 0 else used_limit
     console.print(
         f"扫描完成，共 {len(final_entries)} 条目录 (扫描页数: {pages_label})"
+    )
+    # Additional English timing summary for power users
+    print_step_complete(
+        "Scan completed",
+        scan_elapsed,
+        f"scanned {pages_label} pages, found {len(final_entries)} entries",
     )
     if page_offset is not None:
         console.print(
@@ -533,7 +577,29 @@ def _run_scan(args: argparse.Namespace) -> None:
         else:
             # Build canonical page map for current PDF based on dominant dimensions
             try:
-                current_fps, page_count = compute_pdf_fingerprints(pdf_path)
+                if is_interactive():
+                    with timed_progress(
+                        "Computing fingerprints for apply...",
+                        total=None,
+                        report=report,
+                        step_name="Computing fingerprints (apply)",
+                    ) as (progress, task_id):
+                        reporter = ProgressReporter(progress, task_id)
+
+                        def _fp_cb(done: int, total: int) -> None:
+                            reporter(
+                                done,
+                                total,
+                                f"Computing fingerprints... {done}/{total} pages",
+                            )
+
+                        current_fps, page_count = compute_pdf_fingerprints(
+                            pdf_path,
+                            progress_callback=_fp_cb,
+                        )
+                else:
+                    with timed_step("Computing fingerprints (apply)", report):
+                        current_fps, page_count = compute_pdf_fingerprints(pdf_path)
             except Exception:
                 current_fps, page_count = [], _get_pdf_page_count(pdf_path)
 
@@ -542,25 +608,52 @@ def _run_scan(args: argparse.Namespace) -> None:
                 build_canonical_map_for_dims(current_fps, dims) if dims else {}
             )
 
-            refined_offset = _refine_offset_with_mapping(
-                final_entries, canonical_map, page_offset
-            )
-            if refined_offset != page_offset:
-                console.print(
-                    f"[cyan]Refined printed-page offset: {refined_offset:+d} (was {page_offset}).[/]"
+            with timed_step("Mapping TOC entries (scan/apply)", report):
+                refined_offset = _refine_offset_with_mapping(
+                    final_entries, canonical_map, page_offset
                 )
-            resolved_entries = _apply_page_mapping(
-                final_entries, canonical_map, refined_offset, page_count
-            )
+                if refined_offset != page_offset:
+                    console.print(
+                        f"[cyan]Refined printed-page offset: {refined_offset:+d} (was {page_offset}).[/]"
+                    )
+                resolved_entries = _apply_page_mapping(
+                    final_entries, canonical_map, refined_offset, page_count
+                )
 
             pdf_output_path = pdf_output_default
             try:
-                result = write_pdf_toc(
-                    pdf_path,
-                    resolved_entries,
-                    pdf_output_path,
-                    page_offset=None,
-                )
+                if is_interactive():
+                    total_entries = len(resolved_entries)
+                    with timed_progress(
+                        "Writing PDF bookmarks...",
+                        total=total_entries or None,
+                        report=report,
+                        step_name="Writing PDF bookmarks",
+                    ) as (progress, task_id):
+                        reporter = ProgressReporter(progress, task_id)
+
+                        def _write_progress(done: int, total: int) -> None:
+                            reporter(
+                                done,
+                                total,
+                                f"Writing PDF bookmarks... {done}/{total} entries",
+                            )
+
+                        result = write_pdf_toc(
+                            pdf_path,
+                            resolved_entries,
+                            pdf_output_path,
+                            page_offset=None,
+                            progress_callback=_write_progress,
+                        )
+                else:
+                    with timed_step("Writing PDF bookmarks", report):
+                        result = write_pdf_toc(
+                            pdf_path,
+                            resolved_entries,
+                            pdf_output_path,
+                            page_offset=None,
+                        )
             except Exception as err:
                 console.print(f"[red]写入 PDF 目录失败: {err}[/]")
                 raise SystemExit(6) from err
@@ -572,6 +665,8 @@ def _run_scan(args: argparse.Namespace) -> None:
                 console.print("[yellow]以下条目因异常被跳过：[/]")
                 for reason in result.skipped:
                     console.print(f"  - {reason}")
+            # Print timing summary for scan+apply when apply_toc is enabled.
+            report.print_summary()
     else:
         console.print("[cyan]未写入 PDF 目录。[/]")
 
@@ -744,6 +839,7 @@ def _refine_offset_with_mapping(
 
 
 def _run_apply(args: argparse.Namespace) -> None:
+    report = TimingReport()
     try:
         pdf_path = ensure_file(args.pdf)
     except FileNotFoundError as err:
@@ -756,8 +852,10 @@ def _run_apply(args: argparse.Namespace) -> None:
         console.print(f"[red]{err}[/]")
         raise SystemExit(1) from err
 
+    # Phase 1: load JSON
     try:
-        raw_data = load_json(json_path)
+        with timed_step("Loading JSON", report):
+            raw_data = load_json(json_path)
     except OSError as err:
         console.print(f"[red]Unable to read JSON: {err}[/]")
         raise SystemExit(4) from err
@@ -808,8 +906,36 @@ def _run_apply(args: argparse.Namespace) -> None:
         else:
             args.goodnotes_clean = False
 
+    # Phase 2: compute fingerprints for current PDF
     try:
-        current_fps, page_count = compute_pdf_fingerprints(pdf_path)
+        if args.goodnotes_clean:
+            # Preserve behaviour for tests that monkeypatch cli.compute_pdf_fingerprints
+            with timed_step("Computing fingerprints", report):
+                current_fps, page_count = compute_pdf_fingerprints(pdf_path)
+        else:
+            if is_interactive():
+                with timed_progress(
+                    "Computing fingerprints...",
+                    total=None,
+                    report=report,
+                    step_name="Computing fingerprints",
+                ) as (progress, task_id):
+                    reporter = ProgressReporter(progress, task_id)
+
+                    def _fp_cb(done: int, total: int) -> None:
+                        reporter(
+                            done,
+                            total,
+                            f"Computing fingerprints... {done}/{total} pages",
+                        )
+
+                    current_fps, page_count = compute_pdf_fingerprints(
+                        pdf_path,
+                        progress_callback=_fp_cb,
+                    )
+            else:
+                with timed_step("Computing fingerprints", report):
+                    current_fps, page_count = compute_pdf_fingerprints(pdf_path)
     except Exception:
         current_fps, page_count = [], _get_pdf_page_count(pdf_path)
 
@@ -822,24 +948,25 @@ def _run_apply(args: argparse.Namespace) -> None:
     refined_offset = args.override_offset if hasattr(args, 'override_offset') and args.override_offset is not None else page_offset
 
     # Optional: VLM-based refinement if API key supplied
-    if getattr(args, 'api_key', None):
-        try:
-            vlm_offset = _infer_page_offset(
-                pdf_path,
-                entries,
-                args.api_key,
-                args.timeout,
-                current_fps,
-                api_base=args.api_base,
-                model=args.model,
-            )
-            if vlm_offset is not None:
-                refined_offset = vlm_offset
-                console.print(
-                    f"[cyan]Refined printed-page offset (VLM): {refined_offset:+d} (was {page_offset}).[/]"
+    if getattr(args, "api_key", None):
+        with timed_step("Refining page offset (VLM)", report):
+            try:
+                vlm_offset = _infer_page_offset(
+                    pdf_path,
+                    entries,
+                    args.api_key,
+                    args.timeout,
+                    current_fps,
+                    api_base=args.api_base,
+                    model=args.model,
                 )
-        except TOCExtractionError:
-            pass
+                if vlm_offset is not None:
+                    refined_offset = vlm_offset
+                    console.print(
+                        f"[cyan]Refined printed-page offset (VLM): {refined_offset:+d} (was {page_offset}).[/]"
+                    )
+            except TOCExtractionError:
+                pass
 
     # If GoodNotes cleaning requested, build clean PDF and resolve via clean->original mapping
     if args.goodnotes_clean:
@@ -899,17 +1026,51 @@ def _run_apply(args: argparse.Namespace) -> None:
         canonical_map: dict[int, int] = {}
         if dims and current_fps:
             canonical_map = build_canonical_map_for_dims(current_fps, dims)
-        refined_offset = _refine_offset_with_mapping(entries, canonical_map, refined_offset)
-        if refined_offset != page_offset and not getattr(args, 'override_offset', None):
+        refined_offset = _refine_offset_with_mapping(
+            entries, canonical_map, refined_offset
+        )
+        if refined_offset != page_offset and not getattr(args, "override_offset", None):
             console.print(
                 f"[cyan]Refined printed-page offset: {refined_offset:+d} (was {page_offset}).[/]"
             )
-        resolved_entries = _apply_page_mapping(
-            entries, canonical_map, refined_offset, page_count
-        )
+        with timed_step("Mapping TOC entries", report):
+            resolved_entries = _apply_page_mapping(
+                entries, canonical_map, refined_offset, page_count
+            )
 
     try:
-        result = write_pdf_toc(pdf_path, resolved_entries, output_path, page_offset=None)
+        if is_interactive():
+            total_entries = len(resolved_entries)
+            with timed_progress(
+                "Writing PDF bookmarks...",
+                total=total_entries or None,
+                report=report,
+                step_name="Writing PDF bookmarks",
+            ) as (progress, task_id):
+                reporter = ProgressReporter(progress, task_id)
+
+                def _write_progress(done: int, total: int) -> None:
+                    reporter(
+                        done,
+                        total,
+                        f"Writing PDF bookmarks... {done}/{total} entries",
+                    )
+
+                result = write_pdf_toc(
+                    pdf_path,
+                    resolved_entries,
+                    output_path,
+                    page_offset=None,
+                    progress_callback=_write_progress,
+                )
+        else:
+            with timed_step("Writing PDF bookmarks", report):
+                result = write_pdf_toc(
+                    pdf_path,
+                    resolved_entries,
+                    output_path,
+                    page_offset=None,
+                )
     except Exception as err:
         console.print(f"[red]Failed to write PDF bookmarks: {err}[/]")
         raise SystemExit(6) from err
@@ -925,6 +1086,9 @@ def _run_apply(args: argparse.Namespace) -> None:
         console.print("[yellow]Skipped entries:[/]")
         for reason in result.skipped:
             console.print(f"  - {reason}")
+
+    # Print per-phase timing summary for apply
+    report.print_summary()
 
 
 def _apply_with_goodnotes_clean(
@@ -1051,13 +1215,39 @@ def _build_clean_pdf(
     try:
         clean = fitz.open()  # type: ignore[attr-defined]
         clean_to_original: dict[int, int] = {}
-        for clean_idx, orig_idx in enumerate(keep_indices, start=1):
-            try:
-                # Append a copy of the original page to the clean document
-                clean.insert_pdf(src, from_page=orig_idx - 1, to_page=orig_idx - 1)
-                clean_to_original[clean_idx] = orig_idx
-            except Exception:
-                continue
+        total = len(keep_indices)
+        if is_interactive():
+            with create_progress(
+                "Building clean PDF...", total=total or None
+            ) as (progress, task_id):
+                processed = 0
+                for clean_idx, orig_idx in enumerate(keep_indices, start=1):
+                    try:
+                        # Append a copy of the original page to the clean document
+                        clean.insert_pdf(
+                            src, from_page=orig_idx - 1, to_page=orig_idx - 1
+                        )
+                        clean_to_original[clean_idx] = orig_idx
+                    except Exception:
+                        continue
+                    processed += 1
+                    progress.update(
+                        task_id,
+                        completed=processed,
+                        total=total or processed,
+                        description=(
+                            f"Building clean PDF... {processed}/{total} pages"
+                            if total
+                            else "Building clean PDF..."
+                        ),
+                    )
+        else:
+            for clean_idx, orig_idx in enumerate(keep_indices, start=1):
+                try:
+                    clean.insert_pdf(src, from_page=orig_idx - 1, to_page=orig_idx - 1)
+                    clean_to_original[clean_idx] = orig_idx
+                except Exception:
+                    continue
 
         # Save to a temporary file
         import tempfile
@@ -1103,39 +1293,87 @@ def _adjust_entries_by_printed(
     checks = 0
     changed = 0
     adjusted = entries[:]
-    for idx in order:
-        if checks >= max_checks:
-            break
-        e = adjusted[idx]
-        guess = _coerce_positive_int(e.get("target_page"))
-        if not guess:
-            continue
-        # Conservative: only adjust on exact printed-page match, nearest to guess
-        exact_matches: list[int] = []
-        for p in range(max(1, guess - window), guess + window + 1):
-            pn = _get_printed_page_number(
-                pdf_path,
-                p - 1,
-                api_key,
-                timeout,
-                api_base=api_base,
-                model=model,
-            )
-            if pn is None:
+
+    if is_interactive():
+        with create_progress(
+            "Verifying printed pages...", total=max_checks
+        ) as (progress, task_id):
+            for idx in order:
+                if checks >= max_checks:
+                    break
+                e = adjusted[idx]
+                guess = _coerce_positive_int(e.get("target_page"))
+                if not guess:
+                    continue
+                # Conservative: only adjust on exact printed-page match, nearest to guess
+                exact_matches: list[int] = []
+                for p in range(max(1, guess - window), guess + window + 1):
+                    pn = _get_printed_page_number(
+                        pdf_path,
+                        p - 1,
+                        api_key,
+                        timeout,
+                        api_base=api_base,
+                        model=model,
+                    )
+                    if pn is None:
+                        continue
+                    if int(pn) == int(e.get("target_page") or 0):
+                        exact_matches.append(p)
+                checks += 1
+                if exact_matches:
+                    # choose the closest exact match to current guess
+                    best_p = min(exact_matches, key=lambda p: abs(p - guess))
+                    if best_p != guess:
+                        new_e = dict(e)
+                        new_e["target_page"] = best_p
+                        adjusted[idx] = new_e
+                        changed += 1
+                progress.update(
+                    task_id,
+                    completed=checks,
+                    total=max_checks,
+                    description=(
+                        f"Verifying printed pages... {checks}/{max_checks} | "
+                        f"Adjusted: {changed}"
+                    ),
+                )
+    else:
+        for idx in order:
+            if checks >= max_checks:
+                break
+            e = adjusted[idx]
+            guess = _coerce_positive_int(e.get("target_page"))
+            if not guess:
                 continue
-            if int(pn) == int(e.get("target_page") or 0):
-                exact_matches.append(p)
-        checks += 1
-        if exact_matches:
-            # choose the closest exact match to current guess
-            best_p = min(exact_matches, key=lambda p: abs(p - guess))
-            if best_p != guess:
-                new_e = dict(e)
-                new_e["target_page"] = best_p
-                adjusted[idx] = new_e
-                changed += 1
+            exact_matches = []
+            for p in range(max(1, guess - window), guess + window + 1):
+                pn = _get_printed_page_number(
+                    pdf_path,
+                    p - 1,
+                    api_key,
+                    timeout,
+                    api_base=api_base,
+                    model=model,
+                )
+                if pn is None:
+                    continue
+                if int(pn) == int(e.get("target_page") or 0):
+                    exact_matches.append(p)
+            checks += 1
+            if exact_matches:
+                best_p = min(exact_matches, key=lambda p: abs(p - guess))
+                if best_p != guess:
+                    new_e = dict(e)
+                    new_e["target_page"] = best_p
+                    adjusted[idx] = new_e
+                    changed += 1
+
     if changed:
-        console.print(f"[cyan]Printed-page verification adjusted {changed} entries (checked {checks}; exact matches only).")
+        console.print(
+            f"[cyan]Printed-page verification adjusted {changed} entries "
+            f"(checked {checks}; exact matches only)."
+        )
     return adjusted
 
 def _scan_with_adaptive_pages(
@@ -1193,42 +1431,31 @@ def _scan_with_adaptive_pages(
                     cumulative_fingerprints,
                 )
 
-        if console.is_terminal:
+        if is_interactive():
             if window_size <= 0:
                 range_label = "entire document"
-                total_batches_estimate = 1
             else:
                 end_page = start_page + window_size - 1
                 range_label = f"pages {start_page}-{end_page}"
-                total_batches_estimate = max(1, (window_size + batch_size - 1) // batch_size)
 
-            with Progress(
-                SpinnerColumn(),
-                TextColumn("[progress.description]{task.description}"),
-                BarColumn(),
-                TextColumn(
-                    "{task.completed}/{task.total} batches | Found: {task.fields[found]} entries"
-                ),
-                console=console,
-                transient=True,
-            ) as progress:
-                task_id = progress.add_task(
-                    f"Scanning {range_label}...",
-                    total=total_batches_estimate,
-                    found=len(cumulative_entries),
-                )
+            # Show current scan window and cumulative entries while delegating
+            # per-batch updates to the VLM progress callback.
+            with create_progress(
+                f"Scanning {range_label}... | Found: {len(cumulative_entries)} entries",
+                total=None,
+            ) as (progress, task_id):
+                reporter = ProgressReporter(progress, task_id)
 
                 def _progress_callback(
-                    completed_batches: int, total_batches: int, found_entries: int
+                    completed_batches: int,
+                    total_batches: int,
+                    status: str,
                 ) -> None:
-                    total = total_batches or total_batches_estimate
-                    progress.update(
-                        task_id,
-                        completed=completed_batches,
-                        total=total,
-                        found=found_entries,
-                        description=f"Scanning {range_label}...",
+                    desc = (
+                        f"Calling VLM API... {completed_batches}/{total_batches} "
+                        f"batches | {status}"
                     )
+                    reporter(completed_batches, total_batches or 1, desc)
 
                 json_path = fetch_document_json(
                     pdf_path,
@@ -1307,9 +1534,14 @@ def _scan_with_adaptive_pages(
         if next_limit == current_limit:
             return processed_entries, current_limit, page_offset, cumulative_fingerprints
 
-        console.print(
-            f"[yellow]未找到目录，扩展扫描页数到 {next_limit} 页 (批量 {batch_size})...[/]"
-        )
+        if is_interactive():
+            console.print(
+                f"[cyan]Expanding to pages {previous_limit + 1}-{next_limit}...[/]"
+            )
+        else:
+            console.print(
+                f"[yellow]未找到目录，扩展扫描页数到 {next_limit} 页 (批量 {batch_size})...[/]"
+            )
         previous_limit = current_limit
         current_limit = next_limit
 

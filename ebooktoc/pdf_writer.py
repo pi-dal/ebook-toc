@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 from .utils import ensure_output_path, coerce_positive_int as _util_coerce_positive_int
 
@@ -21,8 +21,25 @@ def write_pdf_toc(
     entries: Iterable[dict[str, Any]],
     output_path: Path,
     page_offset: int | None = None,
+    progress_callback: Callable[[int, int], None] | None = None,
 ) -> BookmarkResult:
-    """Write *entries* into the PDF at *pdf_path* and save to *output_path*."""
+    """Write *entries* into the PDF at *pdf_path* and save to *output_path*.
+
+    Parameters
+    ----------
+    pdf_path :
+        Source PDF path.
+    entries :
+        Iterable of TOC entry mappings with ``\"content\"`` and
+        page-related fields.
+    output_path :
+        Destination PDF path.
+    page_offset :
+        Optional offset applied to target pages before writing.
+    progress_callback :
+        Optional callback invoked as ``progress_callback(done, total)``
+        while entries are being prepared. Intended for CLI progress bars.
+    """
 
     try:
         import fitz  # type: ignore[import]
@@ -37,12 +54,16 @@ def write_pdf_toc(
 
     dest_path = ensure_output_path(output_path)
 
+    entries_list = list(entries)
+    total_entries = len(entries_list)
+
     doc = fitz.open(resolved_pdf)  # type: ignore[attr-defined]
     try:
         added = 0
         skipped: list[str] = []
         toc_rows: list[list[Any]] = []
-        for entry in entries:
+        processed = 0
+        for entry in entries_list:
             if not isinstance(entry, dict):
                 skipped.append("Entry is not a dict")
                 continue
@@ -75,6 +96,14 @@ def write_pdf_toc(
                 continue
 
             toc_rows.append([1, title, resolved_page])
+
+            processed += 1
+            if progress_callback is not None:
+                try:
+                    progress_callback(processed, total_entries)
+                except Exception:
+                    # Progress reporting is best-effort only.
+                    pass
 
         success = False
         if toc_rows and hasattr(doc, "set_toc"):

@@ -73,6 +73,7 @@ def build_canonical_map_for_dims(
 def compute_pdf_fingerprints(
     pdf_path: Path,
     limit: int | None = None,
+    progress_callback: Callable[[int, int], None] | None = None,
 ) -> tuple[list[dict[str, Any]], int]:
     try:
         import fitz  # type: ignore[import]
@@ -88,4 +89,10 @@ def compute_pdf_fingerprints(
             page = doc.load_page(index)
             text = page.get_text("text").strip()
             fingerprints.append(build_page_fingerprint(page, text))
+            if progress_callback is not None:
+                try:
+                    progress_callback(index + 1, end_page)
+                except Exception:
+                    # Progress updates are best-effort only.
+                    pass
     return fingerprints, page_count
