@@ -1,23 +1,51 @@
 # Repository Guidelines
 
 ## Project Structure & Module Organization
-Core code lives in `ebooktoc/`: `cli.py` handles argument parsing, `toc_parser.py` cleans SiliconFlow responses, `vlm_api.py` speaks to the VLM API, `pdf_writer.py` embeds bookmarks, and `utils.py` hosts filesystem helpers. Generated artifacts belong in `output/json` or `output/pdf` so the repository root stays clean. `pyproject.toml` and `pdm.lock` define dependencies and the `ebook-toc` script entry.
+- Core code lives in `ebooktoc/`:
+  - `cli.py` – CLI entrypoint (`scan`, `apply`), argument parsing, prompts.
+  - `vlm_api.py` – OpenAI‑format VLM client (SiliconFlow by default), batching, JSON parsing, offset inference.
+  - `toc_parser.py` – TOC normalization, filtering, and heuristics.
+  - `pdf_writer.py` – writes bookmarks into PDFs.
+  - `fingerprints.py` – page fingerprinting and canonical page mapping.
+  - `utils.py` – filesystem and small helpers.
+- Tests live in `tests/` (`test_*.py`).
+- Generated artifacts should go under `output/json/` and `output/pdf/` (not committed).
 
 ## Build, Test, and Development Commands
-- `pdm install` – install the Python 3.9+ environment declared in `pyproject.toml`.
-- `pdm run ebook-toc scan sample.pdf --api-key $SILICONFLOW_API_KEY --output output/json/sample_toc.json` – scan a PDF and write TOC JSON.
-- `pdm run ebook-toc apply sample.pdf output/json/sample_toc.json --output output/pdf/sample_with_toc.pdf` – embed an existing TOC into a PDF copy.
-- `pdm run python -m ebooktoc.cli help scan` – inspect CLI help without invoking the console script.
-- `pdm run pytest tests/` – future test entry once `tests/` lands.
+- Install dependencies: `pdm install`  
+- Run CLI: `pdm run ebook-toc scan input.pdf --api-key $KEY --output output/json/input_toc.json`  
+  and `pdm run ebook-toc apply input.pdf output/json/input_toc.json --output output/pdf/input_with_toc.pdf`.
+- Inspect help: `pdm run python -m ebooktoc.cli help scan`.
+- Run tests with coverage: `pdm run pytest`.
 
 ## Coding Style & Naming Conventions
-Follow PEP 8 with four-space indentation and type hints on public helpers (match the current modules). Prefer `Path` objects, descriptive CLI flags, `f`-strings, and small reusable helpers in `utils.py`. Emit user-facing text through the shared `rich.Console` so formatting stays consistent across commands.
+- Python 3.10+, PEP 8, 4‑space indentation.
+- Use type hints on public functions, `Path` for filesystem paths, and f‑strings for formatting.
+- Prefer small, reusable helpers in `utils.py`.
+- Emit user‑facing messages via a shared `rich.Console` instance (`console` in `cli.py`).
 
 ## Testing Guidelines
-Automated tests are not yet present, so introduce a `tests/` package with `pytest`. Mock SiliconFlow calls by patching `fetch_document_json`, keep fixture PDFs tiny, and cover parser utilities plus CLI validation before touching PDF writes. Run `pdm run pytest` prior to any PR and note skipped scenarios in the PR description.
+- Test framework: `pytest` (with `pytest-cov` configured in `pyproject.toml`).
+- Place tests in `tests/` and name files `test_*.py`.
+- When hitting the VLM, mock at the API boundary (e.g., patch `ebooktoc.vlm_api.fetch_document_json` or `_call_chat_completion`) to keep tests fast and deterministic.
+- Aim to keep or improve coverage for touched modules.
 
 ## Commit & Pull Request Guidelines
-Commits use concise imperative subjects (see `git log`, e.g., “Add apply subcommand to reuse saved TOC JSON”). Keep each commit focused on one concern and mention any user-facing change in the body. Pull requests should explain motivation, summarize CLI impact, list commands/tests executed, link issues, and add JSON or console snippets when introducing new prompt flows.
+- Use concise, imperative commit messages (e.g., “Add apply subcommand for saved TOC JSON”).
+- Keep each PR focused; describe motivation, key changes, and CLI impact.
+- Include example commands and/or JSON snippets when changing prompt flows or VLM behavior.
+- Link related issues and note which tests/commands were run.
 
 ## Security & Configuration Tips
-Never commit SiliconFlow API keys; export them in your shell profile and pass them via `--api-key $SILICONFLOW_API_KEY`. Keep proprietary PDFs out of version control and clean intermediate files under `output/` before pushing. Prefer HTTPS for `--remote-url` downloads and extend `.gitignore` before adding new caches or logs so sensitive data stays local.
+- Never commit API keys; pass them via `--api-key` or environment variables.
+- Do not commit proprietary PDFs; keep them local under `output/`.
+- Prefer HTTPS for `--remote-url` sources and extend `.gitignore` before adding new caches or logs.
+
+## Agent-Specific Instructions
+You are operating in an environment where `ast-grep` is installed. For any code search that requires understanding of syntax or code structure, you should default to using:
+
+```bash
+ast-grep --lang python -p '<pattern>'
+```
+
+Adjust the `--lang` flag as needed for the specific programming language. Avoid using text-only search tools unless a plain-text search is explicitly requested.

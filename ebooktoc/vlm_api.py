@@ -43,6 +43,31 @@ class TOCExtractionError(RuntimeError):
     """Raised when the external TOC extraction service fails."""
 
 
+def _is_retryable_error(exc: Exception) -> bool:
+    """Return True when a wrapped exception is safe to retry.
+
+    We inspect ``exc.__cause__`` (as produced by ``raise ... from``) and treat:
+
+    - HTTP 429 / 5xx as retryable (rate limiting / transient server errors)
+    - ``requests.Timeout`` and ``requests.ConnectionError`` as retryable
+    - Other errors as non-retryable.
+    """
+    cause = getattr(exc, "__cause__", None)
+
+    if isinstance(cause, requests.Timeout):
+        return True
+    if isinstance(cause, requests.ConnectionError):
+        return True
+
+    if isinstance(cause, requests.HTTPError) and cause.response is not None:
+        status = cause.response.status_code
+        if status in (429, 500, 502, 503, 504):
+            return True
+        return False
+
+    return False
+
+
 def fetch_document_json(
     pdf_path: Optional[Path],
     api_key: str,
@@ -972,4 +997,3 @@ def _safe_unlink(path: Path) -> None:
         return
     except OSError:
         pass
-
