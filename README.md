@@ -46,15 +46,17 @@ pdm run ebook-toc apply input.pdf output/json/input_toc.json --goodnotes-clean -
 ```
 
 - `input.pdf`: path to the source PDF.
-- `--api-key`: SiliconFlow API token.
+- `--api-key`: VLM API token (OpenAI-format; default backend is SiliconFlow).
+- `--api-base`: OpenAI-compatible API base URL (e.g. `https://api.siliconflow.cn/v1` or `https://api.openai.com/v1`); defaults to SiliconFlow when omitted.
+- `--model`: VLM model name in OpenAI format (default `Qwen/Qwen3-VL-32B-Instruct`).
 - `--output`: path to the output JSON file (defaults to `toc.json`).
 - `--pages`: number of leading pages to analyze (default `10`, use `0` for the full document).
 - `--remote-url`: optional PDF URL; when provided the local `input.pdf` argument can be omitted.
-- `--timeout`: SiliconFlow request timeout in seconds (default `600`).
+- `--timeout`: VLM request timeout in seconds (default `600`).
 - `--max-pages`: upper bound for automatic page expansion when no TOC is detected (default `50`).
 - `--step-pages`: increase in pages per expansion step (default `10`).
 - `--no-auto-expand`: disable automatic expansion and use only the initial `--pages` value.
-- `--batch-size`: number of pages sent to SiliconFlow per request (default `3`).
+- `--batch-size`: number of pages sent to the VLM backend per request (default `3`).
 - `--save-json`: skip the prompt and persist the TOC JSON to disk.
 - `--apply-toc`: skip the prompt and write the TOC into the PDF as bookmarks.
 - `scan --goodnotes-clean`: detect and strip non-dominant-size pages (e.g., GoodNotes inserts) before scanning,
@@ -78,7 +80,7 @@ The CLI writes a JSON list containing the detected table-of-contents items:
 
 `page` records where the TOC text was found, whereas `target_page` (if present) captures the destination page referenced in the entry. The CLI prints a status message before scanning and reports the number of entries upon completion. Future extensions can reuse this output to create PDF bookmarks or other metadata.
 
-If no entries are detected within the initial page window, the tool automatically expands the range by `--step-pages` (unless `--no-auto-expand` is set) until it reaches `--max-pages`. Each batch submitted to SiliconFlow (default 3 pages; configurable with `--batch-size`) is deduplicated, and the results can be further narrowed via `--filter-contains` / `--filter-regex`.
+If no entries are detected within the initial page window, the tool automatically expands the range by `--step-pages` (unless `--no-auto-expand` is set) until it reaches `--max-pages`. Each batch submitted to the VLM backend (default 3 pages; configurable with `--batch-size`) is deduplicated, and the results can be further narrowed via `--filter-contains` / `--filter-regex`.
 
 During scanning the CLI also samples a few PDF pages with the VLM to infer the offset between the PDF index and the printed page number. The inferred offset is shown in the terminal (and stored in the JSON) so that bookmarks align with the book’s logical pagination, even when the document contains unnumbered front matter.
 
@@ -89,14 +91,14 @@ You can rerun bookmark creation later with `ebook-toc apply`, passing the previo
 ## How It Works
 
 - Input handling (`ebooktoc/cli.py`): validates local files or downloads remote PDFs; optionally creates a GoodNotes‑cleaned copy by keeping only dominant page sizes.
-- Page extraction (`ebooktoc/siliconflow_api.py`): extracts per‑page text (or renders JPEG when text is empty), batches VLM requests, and parses JSON robustly.
+- Page extraction (`ebooktoc/vlm_api.py`): extracts per‑page text (or renders JPEG when text is empty), batches VLM requests, and parses JSON robustly.
 - TOC parsing (`ebooktoc/toc_parser.py`): normalizes entries, deduplicates, filters, and infers missing trailing numeric targets.
 - Offset and mapping (`ebooktoc/fingerprints.py`, `ebooktoc/cli.py`): computes dominant dimensions, builds a canonical index map (logical → PDF), and estimates printed‑page offsets by sampling pages with the VLM; stores `toc`, `page_offset`, `fingerprints`, and `page_map` in JSON.
 - Apply phase (`ebooktoc/pdf_writer.py`, `ebooktoc/cli.py`): rebuilds the canonical map, refines the offset, resolves target pages, and writes bookmarks.
 
 Primary modules:
 - `ebooktoc/cli.py`: CLI commands (`scan`, `apply`), coordination, prompts, and IO
-- `ebooktoc/siliconflow_api.py`: batching, VLM calls, JSON parsing, offset estimation
+- `ebooktoc/vlm_api.py`: batching, VLM calls, JSON parsing, offset estimation
 - `ebooktoc/toc_parser.py`: TOC normalization, deduplication, filtering, heuristics
 - `ebooktoc/fingerprints.py`: dominant‑dimension detection and canonical index mapping
 - `ebooktoc/pdf_writer.py`: bookmark embedding and result reporting
@@ -124,11 +126,11 @@ Primary modules:
 
 - Alpha quality. The current solution is intentionally quick‑and‑dirty to validate the end‑to‑end flow with real PDFs.
 - API and JSON schema may evolve; minor breaking changes are possible before v1.0.
-- The SiliconFlow integration is a testbed; additional VLM backends will be supported.
+- The default backend is SiliconFlow, but any OpenAI-format VLM can be used via `--api-base` and `--model`.
 
 ## Roadmap / TODO
 
-- Support additional VLM backends beyond SiliconFlow
+- Continue improving support for additional OpenAI-format VLM backends
 - Expand and harden the test suite
 - Improve and extend developer documentation
 - Add an interactive TUI for local use

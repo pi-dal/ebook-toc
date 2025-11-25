@@ -2,7 +2,7 @@
 
 __all__ = [
     "cli",
-    "siliconflow_api",
+    "vlm_api",
     "toc_parser",
     "utils",
     "pdf_writer",

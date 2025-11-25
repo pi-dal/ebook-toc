@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import ebooktoc.siliconflow_api as api
+import ebooktoc.vlm_api as api
 
 
 def test_payload_cache_returns_fingerprint_not_page_number(monkeypatch, tmp_path):
@@ -33,4 +33,3 @@ def test_payload_cache_returns_fingerprint_not_page_number(monkeypatch, tmp_path
     p2, f2 = api._get_or_render_page_payload(pdf, 0)
     assert p2 == payload
     assert f2 == fingerprint
-
