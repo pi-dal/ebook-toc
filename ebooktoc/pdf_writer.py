@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable, List, Optional
+from typing import Any, Iterable
 
 from .utils import ensure_output_path, coerce_positive_int as _util_coerce_positive_int
 
@@ -12,7 +12,7 @@ from .utils import ensure_output_path, coerce_positive_int as _util_coerce_posit
 @dataclass
 class BookmarkResult:
     added: int
-    skipped: List[str]
+    skipped: list[str]
     output_path: Path
 
 
@@ -20,7 +20,7 @@ def write_pdf_toc(
     pdf_path: Path,
     entries: Iterable[dict[str, Any]],
     output_path: Path,
-    page_offset: Optional[int] = None,
+    page_offset: int | None = None,
 ) -> BookmarkResult:
     """Write *entries* into the PDF at *pdf_path* and save to *output_path*."""
 
@@ -40,8 +40,8 @@ def write_pdf_toc(
     doc = fitz.open(resolved_pdf)  # type: ignore[attr-defined]
     try:
         added = 0
-        skipped: List[str] = []
-        toc_rows: List[List[Any]] = []
+        skipped: list[str] = []
+        toc_rows: list[list[Any]] = []
         for entry in entries:
             if not isinstance(entry, dict):
                 skipped.append("Entry is not a dict")
@@ -103,7 +103,7 @@ def write_pdf_toc(
     return BookmarkResult(added=added, skipped=skipped, output_path=dest_path)
 
 
-def _coerce_page(value: Optional[Any]) -> Optional[int]:
+def _coerce_page(value: Any | None) -> int | None:
     # Delegate to shared util to keep semantics consistent
     return _util_coerce_positive_int(value)
 

@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
-from typing import Any, Dict, Iterable, List, Optional, Pattern, Set
+from typing import Any, Iterable, Pattern, Set
 import re
+import difflib
+import unicodedata
 
 _TOC_KEYWORDS = ("目录", "contents")
 
 
-def extract_toc_entries(document: Any) -> List[Dict[str, Any]]:
+def extract_toc_entries(document: Any) -> list[dict[str, Any]]:
     """Return TOC entries detected in the document JSON.
 
     SiliconFlow is prompted to return a JSON array of {"page", "content"} objects,
@@ -21,7 +23,7 @@ def extract_toc_entries(document: Any) -> List[Dict[str, Any]]:
 
     if isinstance(document, dict):
         pages = document.get("pages", [])
-        entries: List[Dict[str, Any]] = []
+        entries: list[dict[str, Any]] = []
 
         for index, page in enumerate(pages):
             if not isinstance(page, dict):
@@ -52,8 +54,8 @@ def extract_toc_entries(document: Any) -> List[Dict[str, Any]]:
     raise TypeError("Unsupported TOC document format; expected list or dict")
 
 
-def _normalize_entries(items: Iterable[Any]) -> List[Dict[str, Any]]:
-    normalized: List[Dict[str, Any]] = []
+def _normalize_entries(items: Iterable[Any]) -> list[dict[str, Any]]:
+    normalized: list[dict[str, Any]] = []
 
     for item in items:
         if not isinstance(item, dict):
@@ -71,7 +73,7 @@ def _normalize_entries(items: Iterable[Any]) -> List[Dict[str, Any]]:
         if not isinstance(content, str) or not content.strip():
             continue
 
-        entry: Dict[str, Any] = {"page": page_number, "content": content.strip()}
+        entry: dict[str, Any] = {"page": page_number, "content": content.strip()}
 
         target_value = _coerce_optional_int(target_page)
         if target_value is not None:
@@ -87,7 +89,7 @@ def _contains_toc_keyword(text: str) -> bool:
     return any(keyword in lower_text for keyword in _TOC_KEYWORDS)
 
 
-def _coerce_optional_int(value: Any) -> Optional[int]:
+def _coerce_optional_int(value: Any) -> int | None:
     if value is None:
         return None
     try:
@@ -97,9 +99,71 @@ def _coerce_optional_int(value: Any) -> Optional[int]:
     return result
 
 
-def deduplicate_entries(entries: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    seen: Set[tuple[Any, ...]] = set()
-    deduped: List[Dict[str, Any]] = []
+def _normalize_for_comparison(text: str) -> str:
+    """Return a normalised string for TOC comparison.
+
+    The normalisation pipeline is designed to treat minor formatting
+    differences as equivalent while preserving enough structure to avoid
+    over-merging distinct entries.
+
+    Steps
+    -----
+    text :
+        Raw TOC title text.
+
+    The function applies:
+
+    - Unicode normalisation (NFKC) to merge compatibility characters.
+    - Lowercasing.
+    - Removal of common chapter/section numbering prefixes such as
+      "第一章", "第1章", "1.1", or "1 ".
+    - Removal of trailing page numbers and dot leaders (e.g. "...... 123").
+    """
+
+    s = unicodedata.normalize("NFKC", text)
+    s = s.strip().lower()
+    if not s:
+        return s
+
+    # Strip leading Chinese/Arabic chapter numbering like "第一章", "第1章".
+    prefix_patterns = [
+        r"^第[一二三四五六七八九十百千0-9]+[章节卷部篇回]\s*",
+        r"^[0-9]+(?:[．\.\-、][0-9]+)*\s+",
+        r"^[0-9]+\s+",
+    ]
+    for pat in prefix_patterns:
+        s = re.sub(pat, "", s, count=1)
+
+    # Remove trailing page numbers and dot leaders, mirroring infer heuristics.
+    s = re.sub(r"(?:[.·\s]{2,})(\d{1,4})\s*$", "", s)
+    s = re.sub(r"\s+(\d{1,4})\s*$", "", s)
+
+    return s.strip()
+
+
+def deduplicate_entries(
+    entries: Iterable[dict[str, Any]],
+    *,
+    fuzzy_threshold: float | None = 0.85,
+) -> list[dict[str, Any]]:
+    """Deduplicate TOC entries by normalised content and target_page.
+
+    Parameters
+    ----------
+    entries :
+        Iterable of TOC entry mappings with at least ``\"content\"`` and
+        ``\"page\"`` keys, and an optional ``\"target_page\"``.
+    fuzzy_threshold :
+        Optional similarity threshold in the range [0, 1]. When set, a new
+        entry is considered a duplicate if its normalised content is within
+        ``fuzzy_threshold`` of any of the last 50 accepted entries with the
+        same ``target_page`` according to :class:`difflib.SequenceMatcher`.
+        When ``None``, only exact normalised matches are deduplicated.
+    """
+
+    seen_exact: Set[tuple[str, Any]] = set()
+    history: list[tuple[str, Any]] = []
+    deduped: list[dict[str, Any]] = []
 
     for entry in entries:
         if not isinstance(entry, dict):
@@ -114,23 +178,56 @@ def deduplicate_entries(entries: Iterable[Dict[str, Any]]) -> List[Dict[str, Any
             continue
 
         target_page = entry.get("target_page")
-        key = (normalized_content.lower(), target_page)
-        if key in seen:
-            continue
-        seen.add(key)
+        norm_key = _normalize_for_comparison(normalized_content)
+        if not norm_key:
+            # Fall back to simple lowercase content when everything was stripped.
+            norm_key = normalized_content.lower()
 
+        exact_key = (norm_key, target_page)
+        if exact_key in seen_exact:
+            continue
+
+        is_duplicate = False
+        if fuzzy_threshold is not None:
+            # Compare against at most the last 50 accepted items to cap runtime.
+            for prev_norm, prev_target in reversed(history[-50:]):
+                if prev_target != target_page:
+                    continue
+
+                # Fast path: treat short prefix extensions as duplicates
+                # (e.g. "绪论" vs "绪论与背景") to handle minor elaborations.
+                shorter, longer = (
+                    (norm_key, prev_norm)
+                    if len(norm_key) <= len(prev_norm)
+                    else (prev_norm, norm_key)
+                )
+                if len(shorter) >= 2 and longer.startswith(shorter):
+                    if len(longer) - len(shorter) <= 6:
+                        is_duplicate = True
+                        break
+
+                ratio = difflib.SequenceMatcher(None, norm_key, prev_norm).ratio()
+                if ratio >= fuzzy_threshold:
+                    is_duplicate = True
+                    break
+
+        if is_duplicate:
+            continue
+
+        seen_exact.add(exact_key)
+        history.append((norm_key, target_page))
         deduped.append({**entry, "content": normalized_content})
 
     return deduped
 
 
 def filter_entries(
-    entries: Iterable[Dict[str, Any]],
-    contains: Optional[str] = None,
-    pattern: Optional[Pattern[str]] = None,
-) -> List[Dict[str, Any]]:
+    entries: Iterable[dict[str, Any]],
+    contains: str | None = None,
+    pattern: Pattern[str] | None = None,
+) -> list[dict[str, Any]]:
     contains_lc = contains.lower() if contains else None
-    filtered: List[Dict[str, Any]] = []
+    filtered: list[dict[str, Any]] = []
 
     for entry in entries:
         if not isinstance(entry, dict):
@@ -155,7 +252,7 @@ def filter_entries(
     return filtered
 
 
-def infer_missing_targets(entries: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def infer_missing_targets(entries: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
     """Try to infer missing target_page from the entry content.
 
     Heuristics:
@@ -166,7 +263,7 @@ def infer_missing_targets(entries: Iterable[Dict[str, Any]]) -> List[Dict[str, A
     We avoid capturing numeric outline parts like "1.2.3" by anchoring to the end and
     requiring separation before the digits.
     """
-    inferred: List[Dict[str, Any]] = []
+    inferred: list[dict[str, Any]] = []
     # Patterns like "..... 123", "··· 45", or whitespace before trailing digits
     tail_num = re.compile(r"(?:[.·\s]{2,})(\d{1,4})\s*$")
     # Fallback: any trailing digits at end if reasonably isolated
@@ -184,7 +281,7 @@ def infer_missing_targets(entries: Iterable[Dict[str, Any]]) -> List[Dict[str, A
             continue
         text = content.strip()
         m = tail_num.search(text)
-        page_val: Optional[int] = None
+        page_val: int | None = None
         if m:
             try:
                 page_val = int(m.group(1))

@@ -13,10 +13,14 @@ import json
 import tempfile
 import threading
 import time
+from collections import OrderedDict
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Callable, Iterable
 
 import requests
+from requests import Session
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 from .fingerprints import (
     build_page_fingerprint,
@@ -33,10 +37,49 @@ API_BASE_DEFAULT = "https://api.siliconflow.cn/v1"
 MODEL_NAME = "Qwen/Qwen3-VL-32B-Instruct"
 DEFAULT_BATCH_SIZE = 3
 JPEG_QUALITY = 80
+DEFAULT_CACHE_SIZE = 500
+DEFAULT_DPI_SCALE = 1.5
+MAX_IMAGE_DIMENSION = 2048
+
+
+class LRUCache(OrderedDict):
+    """Simple size-bounded LRU cache.
+
+    This cache preserves insertion order and evicts the least recently used
+    key when ``maxsize`` is exceeded. It is intended for small in-memory
+    caches such as rendered page payloads.
+    """
+
+    def __init__(self, maxsize: int = DEFAULT_CACHE_SIZE) -> None:
+        super().__init__()
+        self.maxsize = maxsize
+
+    def __getitem__(self, key: Any) -> Any:  # type: ignore[override]
+        value = super().__getitem__(key)
+        self.move_to_end(key)
+        return value
+
+    def get(self, key: Any, default: Any = None) -> Any:  # type: ignore[override]
+        if key in self:
+            return self[key]
+        return default
+
+    def __setitem__(self, key: Any, value: Any) -> None:  # type: ignore[override]
+        if key in self:
+            self.move_to_end(key)
+        super().__setitem__(key, value)
+        if len(self) > self.maxsize:
+            self.popitem(last=False)
+
+
 # Cache maps (pdf_path, index) -> (payload_entry, fingerprint_dict)
-_PAYLOAD_CACHE: Dict[Tuple[str, int], Tuple[Dict[str, Any], Optional[Dict[str, Any]]]] = {}
-_PAGE_NUMBER_CACHE: Dict[Tuple[str, int], Optional[str]] = {}
+_PAYLOAD_CACHE: LRUCache = LRUCache()
+_PAGE_NUMBER_CACHE: LRUCache = LRUCache()
 _CACHE_LOCK = threading.Lock()
+
+# Shared HTTP session with retry for VLM calls
+_SESSION: Session | None = None
+_SESSION_LOCK = threading.Lock()
 
 
 class TOCExtractionError(RuntimeError):
@@ -69,18 +112,20 @@ def _is_retryable_error(exc: Exception) -> bool:
 
 
 def fetch_document_json(
-    pdf_path: Optional[Path],
+    pdf_path: Path | None,
     api_key: str,
     poll_interval: int = 5,  # kept for CLI compatibility; unused
     timeout: int = 600,  # kept for CLI compatibility; unused
     page_limit: int = 15,
-    remote_url: Optional[str] = None,
-    task_id: Optional[str] = None,
+    remote_url: str | None = None,
+    task_id: str | None = None,
     *,
     batch_size: int = DEFAULT_BATCH_SIZE,
     start_page: int = 1,
-    api_base: Optional[str] = None,
-    model: Optional[str] = None,
+    api_base: str | None = None,
+    model: str | None = None,
+    max_workers: int = 3,
+    progress_callback: Callable[[int, int, int], None] | None = None,
 ) -> Path:
     """Extract TOC data using an OpenAI-format VLM API (default: SiliconFlow Qwen).
 
@@ -123,11 +168,11 @@ def fetch_document_json(
         page_payloads, fingerprints = _collect_page_payloads(
             source_path, page_limit, start_page=start_page
         )
-        aggregated: List[Dict[str, Any]] = []
+        aggregated: list[dict[str, Any]] = []
         effective_model = model or MODEL_NAME
 
         effective_batch = max(1, batch_size)
-        batches: List[List[Dict[str, Any]]] = list(
+        batches: list[list[dict[str, Any]]] = list(
             _chunk_iterable(page_payloads, effective_batch)
         )
 
@@ -135,10 +180,11 @@ def fetch_document_json(
             max_attempts = 3
 
             def _fetch_toc_for_batch(
-                batch: List[Dict[str, Any]]
-            ) -> List[Dict[str, Any]]:
+                batch_index: int,
+                batch: list[dict[str, Any]],
+            ) -> list[dict[str, Any]]:
                 attempts = 0
-                last_error: Optional[Exception] = None
+                last_error: Exception | None = None
                 while attempts < max_attempts:
                     attempts += 1
                     payload = _build_payload(
@@ -153,6 +199,14 @@ def fetch_document_json(
                         last_error = exc
                         if attempts >= max_attempts or not _is_retryable_error(exc):
                             raise
+                        try:
+                            from .cli import console  # local import to avoid cycle
+                        except Exception:
+                            console = None  # type: ignore[assignment]
+                        if console is not None:
+                            console.print(
+                                f"[yellow]Batch {batch_index + 1}/{len(batches)} retry {attempts}/{max_attempts}...[/]"
+                            )
                         # Simple exponential backoff capped at 5 seconds
                         sleep_seconds = min(2 ** (attempts - 1), 5)
                         time.sleep(sleep_seconds)
@@ -164,9 +218,24 @@ def fetch_document_json(
                     "Unexpected code path reached in _fetch_toc_for_batch"
                 )
 
-            with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
-                for toc_json in executor.map(_fetch_toc_for_batch, batches):
+            worker_count = max(1, max_workers)
+            with concurrent.futures.ThreadPoolExecutor(max_workers=worker_count) as executor:
+                future_to_index: dict[concurrent.futures.Future[list[dict[str, Any]]], int] = {}
+                for idx, batch in enumerate(batches):
+                    future = executor.submit(_fetch_toc_for_batch, idx, batch)
+                    future_to_index[future] = idx
+
+                completed_batches = 0
+                for future in concurrent.futures.as_completed(future_to_index):
+                    toc_json = future.result()
                     aggregated.extend(toc_json)
+                    completed_batches += 1
+                    if progress_callback is not None:
+                        try:
+                            progress_callback(completed_batches, len(batches), len(aggregated))
+                        except Exception:
+                            # Progress updates are best-effort only.
+                            pass
 
         offset = None
         try:
@@ -183,7 +252,7 @@ def fetch_document_json(
             offset = None
 
         # Build a canonical page map for this source PDF (based on dominant dims)
-        page_map: Dict[int, int] = {}
+        page_map: dict[int, int] = {}
         dims = dominant_dimensions(fingerprints) if fingerprints else None
         if dims:
             raw_map = build_canonical_map_for_dims(fingerprints, dims)
@@ -212,8 +281,8 @@ def fetch_document_json(
 
 
 def _resolve_source_pdf(
-    pdf_path: Optional[Path], remote_url: Optional[str]
-) -> Tuple[Path, bool]:
+    pdf_path: Path | None, remote_url: str | None
+) -> tuple[Path, bool]:
     if remote_url:
         temp_path = _download_remote_pdf(remote_url)
         return temp_path, True
@@ -237,7 +306,7 @@ def _collect_page_payloads(
     max_pages: int,
     *,
     start_page: int = 1,
-) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Collect payloads and fingerprints for a window of PDF pages.
 
     The window is defined by a 1-based ``start_page`` and a maximum number of
@@ -280,8 +349,8 @@ def _collect_page_payloads(
     if start_index >= end_page:
         return [], []
 
-    payloads: List[Dict[str, Any]] = []
-    fingerprints: List[Dict[str, Any]] = []
+    payloads: list[dict[str, Any]] = []
+    fingerprints: list[dict[str, Any]] = []
 
     with concurrent.futures.ThreadPoolExecutor() as executor:
         futures = [
@@ -305,11 +374,11 @@ def _collect_page_payloads(
 
 
 def _build_payload(
-    page_payloads: List[Dict[str, Any]],
+    page_payloads: list[dict[str, Any]],
     max_pages: int,
     start_page: int = 1,
-    model: Optional[str] = None,
-) -> Dict[str, Any]:
+    model: str | None = None,
+) -> dict[str, Any]:
     """Build the chat-completion payload for a window of pages.
 
     Parameters
@@ -332,9 +401,9 @@ def _build_payload(
 
     Returns
     -------
-    Dict[str, Any]
-        The payload dictionary to send to the VLM chat completions
-        API, including system instructions and structured user content.
+    dict[str, Any]
+        The payload dictionary to send to the VLM chat completions API,
+        including system instructions and structured user content.
     """
     instructions = (
         "You are an assistant that extracts a book's table of contents from PDF content. "
@@ -367,7 +436,7 @@ def _build_payload(
         "in the line. Return JSON exactly as described."
     )
 
-    user_content: List[Dict[str, Any]] = [{"type": "text", "text": intro_text}]
+    user_content: list[dict[str, Any]] = [{"type": "text", "text": intro_text}]
 
     for payload in page_payloads:
         page_number = payload["page"]
@@ -416,20 +485,47 @@ def _build_payload(
 
 def _call_chat_completion(
     api_key: str,
-    payload: Dict[str, Any],
+    payload: dict[str, Any],
     request_timeout: int,
-    api_base: Optional[str] = None,
-) -> Dict[str, Any]:
+    api_base: str | None = None,
+) -> dict[str, Any]:
+    def _get_session() -> Session:
+        """Return a shared Session configured with retry.
+
+        The session is initialised lazily to avoid unnecessary work when the
+        module is imported but no network calls are made.
+        """
+
+        global _SESSION
+        if _SESSION is not None:
+            return _SESSION
+        with _SESSION_LOCK:
+            if _SESSION is not None:
+                return _SESSION
+            session = requests.Session()
+            retry = Retry(
+                total=3,
+                backoff_factor=0.5,
+                status_forcelist=(429, 500, 502, 503, 504),
+                allowed_methods=("GET", "POST"),
+                raise_on_status=False,
+            )
+            adapter = HTTPAdapter(max_retries=retry)
+            session.mount("http://", adapter)
+            session.mount("https://", adapter)
+            _SESSION = session
+            return session
+
     base = (api_base or API_BASE_DEFAULT).rstrip("/")
     endpoint = f"{base}/chat/completions"
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
     }
+    timeout = (10, max(1, int(request_timeout)))
+    session = _get_session()
     try:
-        response = requests.post(
-            endpoint, json=payload, headers=headers, timeout=request_timeout
-        )
+        response = session.post(endpoint, json=payload, headers=headers, timeout=timeout)
         response.raise_for_status()
     except requests.HTTPError as exc:
         detail = _safe_json(exc.response) if exc.response is not None else str(exc)
@@ -443,7 +539,7 @@ def _call_chat_completion(
     return body
 
 
-def _parse_response_payload(body: Dict[str, Any]) -> List[Dict[str, Any]]:
+def _parse_response_payload(body: dict[str, Any]) -> list[dict[str, Any]]:
     choices = body.get("choices")
     if not choices:
         raise TOCExtractionError(f"VLM API response missing choices: {body}")
@@ -485,7 +581,7 @@ def _parse_response_payload(body: Dict[str, Any]) -> List[Dict[str, Any]]:
         toc = data
     else:
         raise TOCExtractionError(
-            f"SiliconFlow response must be a JSON array or object with 'toc'; received {type(data).__name__}."
+            f"VLM API response must be a JSON array or object with 'toc'; received {type(data).__name__}."
         )
 
     if not isinstance(toc, list):
@@ -507,7 +603,7 @@ def _extract_json_block(text: str) -> str:
     return candidate if candidate is not None else stripped
 
 
-def _find_json_substring(text: str) -> Optional[str]:
+def _find_json_substring(text: str) -> str | None:
     """Return the first JSON object/array substring found in text.
 
     This implementation is tolerant of leading/trailing commentary and avoids
@@ -538,7 +634,7 @@ def _find_json_substring(text: str) -> Optional[str]:
     return None
 
 
-def _repair_toc_json(json_text: str) -> Optional[Any]:
+def _repair_toc_json(json_text: str) -> Any | None:
     """Best-effort repair for slightly invalid TOC JSON.
 
     SiliconFlow is instructed (and configured via response_format) to return
@@ -555,7 +651,7 @@ def _repair_toc_json(json_text: str) -> Optional[Any]:
     """
 
     keys = ("toc", "page", "target_page", "content")
-    result: List[str] = []
+    result: list[str] = []
     in_string = False
     escape = False
     i = 0
@@ -660,8 +756,8 @@ def _repair_toc_json(json_text: str) -> Optional[Any]:
         return None
 
 
-def _chunk_iterable(items: Iterable[Any], size: int) -> Iterable[List[Any]]:
-    chunk: List[Any] = []
+def _chunk_iterable(items: Iterable[Any], size: int) -> Iterable[list[Any]]:
+    chunk: list[Any] = []
     for item in items:
         chunk.append(item)
         if len(chunk) >= size:
@@ -683,14 +779,14 @@ def _trim_text(text: str, max_lines: int = 120, max_chars: int = 6000) -> str:
 
 def _infer_page_offset(
     pdf_path: Path,
-    entries: List[Dict[str, Any]],
+    entries: list[dict[str, Any]],
     api_key: str,
     timeout: int,
-    fingerprints: Optional[List[Dict[str, Any]]] = None,
+    fingerprints: list[dict[str, Any]] | None = None,
     max_samples: int = 3,
-    api_base: Optional[str] = None,
-    model: Optional[str] = None,
-) -> Optional[int]:
+    api_base: str | None = None,
+    model: str | None = None,
+) -> int | None:
     if not entries:
         return None
 
@@ -704,11 +800,11 @@ def _infer_page_offset(
         page_count = doc.page_count
 
     # Build candidate (canonical_index, pdf_index0) pairs for sampling
-    cano_pdf_pairs: List[Tuple[int, int]] = []
+    cano_pdf_pairs: list[tuple[int, int]] = []
 
     # 1) Prefer sampling at canonical 1/3, 1/2, 2/3 positions on dominant-dimension pages
-    dominant_dims: Optional[tuple[int, int]] = None
-    canonical_map: Dict[int, int] = {}
+    dominant_dims: tuple[int, int] | None = None
+    canonical_map: dict[int, int] = {}
     if fingerprints:
         dominant_dims = dominant_dimensions(fingerprints)
         if dominant_dims:
@@ -752,7 +848,7 @@ def _infer_page_offset(
             if len(cano_pdf_pairs) >= max_samples:
                 break
 
-    offsets: List[int] = []
+    offsets: list[int] = []
     for canonical_idx, index0 in cano_pdf_pairs:
         if index0 < 0 or index0 >= page_count:
             continue
@@ -784,9 +880,9 @@ def _get_printed_page_number(
     index: int,
     api_key: str,
     timeout: int,
-    api_base: Optional[str] = None,
-    model: Optional[str] = None,
-) -> Optional[int]:
+    api_base: str | None = None,
+    model: str | None = None,
+) -> int | None:
     cache_key = (str(pdf_path), index)
     with _CACHE_LOCK:
         if cache_key in _PAGE_NUMBER_CACHE:
@@ -811,7 +907,7 @@ def _get_printed_page_number(
     return result
 
 
-def _render_page_image_base64(pdf_path: Path, index: int) -> Optional[str]:
+def _render_page_image_base64(pdf_path: Path, index: int) -> str | None:
     try:
         import fitz  # type: ignore[import]
     except ImportError:
@@ -822,7 +918,19 @@ def _render_page_image_base64(pdf_path: Path, index: int) -> Optional[str]:
             if index < 0 or index >= doc.page_count:
                 return None
             page = doc.load_page(index)
-            pix = page.get_pixmap(matrix=fitz.Matrix(1.0, 1.0))
+            scale = DEFAULT_DPI_SCALE
+            try:
+                rect = page.rect
+                max_dim = max(rect.width, rect.height)
+                if max_dim > 0:
+                    projected = max_dim * scale
+                    if projected > MAX_IMAGE_DIMENSION:
+                        scale = MAX_IMAGE_DIMENSION / max_dim
+            except Exception:
+                # Fall back to default scale when geometry inspection fails.
+                pass
+            matrix = fitz.Matrix(scale, scale)
+            pix = page.get_pixmap(matrix=matrix)
             image_bytes = _pixmap_to_jpeg(pix)
     except Exception:
         return None
@@ -834,9 +942,9 @@ def _query_page_number(
     api_key: str,
     image_b64: str,
     timeout: int,
-    api_base: Optional[str] = None,
-    model: Optional[str] = None,
-) -> Optional[int]:
+    api_base: str | None = None,
+    model: str | None = None,
+) -> int | None:
     instructions = (
         "You are given an image of a book page. Identify the printed page number "
         "visible on the page. Respond with a JSON object {\"page_number\": <number or null>} "
@@ -897,7 +1005,7 @@ def _query_page_number(
         return None
 
 
-def _coerce_positive_int(value: Any) -> Optional[int]:
+def _coerce_positive_int(value: Any) -> int | None:
     # Backward-compat shim: route to shared util
     return _util_coerce_positive_int(value)
 
@@ -911,7 +1019,7 @@ def _pixmap_to_jpeg(pix: Any) -> bytes:
 
 def _get_or_render_page_payload(
     pdf_path: Path, index: int
-) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
     cache_key = (str(pdf_path), index)
     with _CACHE_LOCK:
         cached = _PAYLOAD_CACHE.get(cache_key)
@@ -925,7 +1033,9 @@ def _get_or_render_page_payload(
     return payload, fingerprint
 
 
-def _render_page_payload(pdf_path: Path, index: int) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
+def _render_page_payload(
+    pdf_path: Path, index: int
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
     try:
         import fitz  # type: ignore[import]
     except ImportError:
@@ -946,7 +1056,18 @@ def _render_page_payload(pdf_path: Path, index: int) -> Tuple[Optional[Dict[str,
         if text:
             entry["text"] = _trim_text(text)
         else:
-            pix = page.get_pixmap(matrix=fitz.Matrix(1.0, 1.0))
+            scale = DEFAULT_DPI_SCALE
+            try:
+                rect = page.rect
+                max_dim = max(rect.width, rect.height)
+                if max_dim > 0:
+                    projected = max_dim * scale
+                    if projected > MAX_IMAGE_DIMENSION:
+                        scale = MAX_IMAGE_DIMENSION / max_dim
+            except Exception:
+                pass
+            matrix = fitz.Matrix(scale, scale)
+            pix = page.get_pixmap(matrix=matrix)
             image_bytes = _pixmap_to_jpeg(pix)
             if not image_bytes:
                 return None, fingerprint
@@ -981,7 +1102,7 @@ def _write_temp_json(data: Any) -> Path:
     return Path(tmp.name)
 
 
-def _safe_json(response: Optional[requests.Response]) -> Any:
+def _safe_json(response: requests.Response | None) -> Any:
     if response is None:
         return None
     try:

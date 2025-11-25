@@ -6,11 +6,12 @@ import argparse
 import re
 import sys
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 from urllib.parse import urlparse
 
 import requests
 from rich.console import Console
+from rich.progress import BarColumn, Progress, SpinnerColumn, TextColumn
 from . import __version__
 
 from .fingerprints import (
@@ -155,6 +156,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=10,
         help="Number of pages to send per VLM request (default: 10).",
+    )
+    scan_parser.add_argument(
+        "--max-workers",
+        type=int,
+        default=3,
+        help="Maximum number of concurrent VLM requests (default: 3).",
     )
     scan_parser.add_argument(
         "--save-json",
@@ -361,9 +368,9 @@ def _run_scan(args: argparse.Namespace) -> None:
 
     try:
         # Optional GoodNotes cleaning for scan: strip non-dominant-size pages before calling VLM
-        original_pdf_for_output: Optional[Path] = pdf_path
-        temp_download: Optional[Path] = None
-        clean_pdf_path: Optional[Path] = None
+        original_pdf_for_output: Path | None = pdf_path
+        temp_download: Path | None = None
+        clean_pdf_path: Path | None = None
         clean_map: dict[int, int] = {}
 
         if goodnotes_clean:
@@ -432,6 +439,7 @@ def _run_scan(args: argparse.Namespace) -> None:
             contains=args.filter_contains,
             pattern=pattern,
             batch_size=args.batch_size,
+            max_workers=args.max_workers,
             api_base=args.api_base,
             model=args.model,
         )
@@ -568,7 +576,7 @@ def _run_scan(args: argparse.Namespace) -> None:
         console.print("[cyan]未写入 PDF 目录。[/]")
 
 
-def main(argv: Optional[list[str]] = None) -> None:
+def main(argv: list[str] | None = None) -> None:
     parser = build_parser()
     args = parser.parse_args(argv)
 
@@ -579,7 +587,7 @@ def main(argv: Optional[list[str]] = None) -> None:
     args.func(args)
 
 
-def _derive_output_stem(pdf_path: Optional[Path], remote_url: Optional[str]) -> str:
+def _derive_output_stem(pdf_path: Path | None, remote_url: str | None) -> str:
     if pdf_path:
         return pdf_path.stem
     if remote_url:
@@ -594,7 +602,7 @@ def _download_to_temp(url: str) -> Path:
     return _util_download_to_temp(url, suffix=".pdf", prefix="scan-")
 
 
-def _print_toc_preview(entries: list[dict[str, Any]], page_offset: Optional[int]) -> None:
+def _print_toc_preview(entries: list[dict[str, Any]], page_offset: int | None) -> None:
     if not entries:
         console.print("[yellow]未检测到目录条目。[/]")
         return
@@ -636,14 +644,14 @@ def _prompt_yes_no(question: str, default: bool) -> bool:
         console.print("[yellow]Please respond with 'y' or 'n'.[/]")
 
 
-def _coerce_positive_int(value: Any) -> Optional[int]:
+def _coerce_positive_int(value: Any) -> int | None:
     return _util_coerce_positive_int(value)
 
 
 def _apply_page_mapping(
     entries: list[dict[str, Any]],
-    mapping: Dict[int, int],
-    page_offset: Optional[int],
+    mapping: dict[int, int],
+    page_offset: int | None,
     page_count: int,
 ) -> list[dict[str, Any]]:
     resolved_entries: list[dict[str, Any]] = []
@@ -693,10 +701,10 @@ def _get_pdf_page_count(pdf_path: Path) -> int:
 
 def _refine_offset_with_mapping(
     entries: list[dict[str, Any]],
-    mapping: Dict[int, int],
-    initial_offset: Optional[int],
+    mapping: dict[int, int],
+    initial_offset: int | None,
     window: int = 40,
-) -> Optional[int]:
+) -> int | None:
     """Return an offset that maximizes mapping hits for target_page + offset.
 
     This is robust when VLM-estimated offset is off; we search a neighborhood
@@ -754,8 +762,8 @@ def _run_apply(args: argparse.Namespace) -> None:
         console.print(f"[red]Unable to read JSON: {err}[/]")
         raise SystemExit(4) from err
 
-    fingerprints = []
-    saved_clean_map: Dict[int, int] = {}
+    fingerprints: list[dict[str, Any]] = []
+    saved_clean_map: dict[int, int] = {}
     if isinstance(raw_data, dict) and "toc" in raw_data:
         entries = extract_toc_entries(raw_data.get("toc"))
         entries = infer_missing_targets(entries)
@@ -765,7 +773,7 @@ def _run_apply(args: argparse.Namespace) -> None:
             fingerprints = stored_fps
         raw_clean_map = raw_data.get("clean_map")
         if isinstance(raw_clean_map, dict):
-            tmp: Dict[int, int] = {}
+            tmp: dict[int, int] = {}
             for k, v in raw_clean_map.items():
                 try:
                     ck = int(k)
@@ -888,7 +896,7 @@ def _run_apply(args: argparse.Namespace) -> None:
             except Exception:
                 pass
     else:
-        canonical_map: Dict[int, int] = {}
+        canonical_map: dict[int, int] = {}
         if dims and current_fps:
             canonical_map = build_canonical_map_for_dims(current_fps, dims)
         refined_offset = _refine_offset_with_mapping(entries, canonical_map, refined_offset)
@@ -922,8 +930,8 @@ def _run_apply(args: argparse.Namespace) -> None:
 def _apply_with_goodnotes_clean(
     pdf_path: Path,
     entries: list[dict[str, Any]],
-    initial_offset: Optional[int],
-    baseline_dims: Optional[tuple[int, int]],
+    initial_offset: int | None,
+    baseline_dims: tuple[int, int] | None,
 ) -> list[dict[str, Any]]:
     """Resolve TOC entries by removing non-dominant-size pages (GoodNotes insertions).
 
@@ -970,7 +978,7 @@ def _apply_with_goodnotes_clean(
             clean_fps, _ = [], 0
 
         clean_dims = dims if dims else dominant_dimensions(clean_fps)
-        canonical_map_clean: Dict[int, int] = {}
+        canonical_map_clean: dict[int, int] = {}
         if clean_dims and clean_fps:
             canonical_map_clean = build_canonical_map_for_dims(clean_fps, clean_dims)
 
@@ -1069,10 +1077,10 @@ def _build_clean_pdf(
 def _adjust_entries_by_printed(
     pdf_path: Path,
     entries: list[dict[str, Any]],
-    api_key: Optional[str],
+    api_key: str | None,
     timeout: int,
-    api_base: Optional[str] = None,
-    model: Optional[str] = None,
+    api_base: str | None = None,
+    model: str | None = None,
     window: int = 6,
     max_checks: int = 80,
 ) -> list[dict[str, Any]]:
@@ -1133,20 +1141,21 @@ def _adjust_entries_by_printed(
 def _scan_with_adaptive_pages(
     *,
     api_key: str,
-    pdf_path: Optional[Path],
-    remote_url: Optional[str],
+    pdf_path: Path | None,
+    remote_url: str | None,
     initial_limit: int,
     max_pages: int,
     step: int,
     timeout: int,
     poll_interval: int,
     auto_expand: bool,
-    contains: Optional[str],
-    pattern: Optional[re.Pattern[str]],
+    contains: str | None,
+    pattern: re.Pattern[str] | None,
     batch_size: int,
-    api_base: Optional[str],
-    model: Optional[str],
-) -> tuple[list[dict[str, Any]], int, Optional[int], list[dict[str, Any]]]:
+    max_workers: int,
+    api_base: str | None,
+    model: str | None,
+) -> tuple[list[dict[str, Any]], int, int | None, list[dict[str, Any]]]:
     current_limit = max(initial_limit, 0)
     effective_step = max(step, 1)
     upper_bound = max_pages if max_pages > 0 else None
@@ -1156,7 +1165,7 @@ def _scan_with_adaptive_pages(
     # appears in a later window we still return earlier candidates.
     cumulative_entries: list[dict[str, Any]] = []
     cumulative_fingerprints: list[dict[str, Any]] = []
-    page_offset: Optional[int] = None
+    page_offset: int | None = None
 
     previous_limit = 0
 
@@ -1184,18 +1193,71 @@ def _scan_with_adaptive_pages(
                     cumulative_fingerprints,
                 )
 
-        json_path = fetch_document_json(
-            pdf_path,
-            api_key,
-            poll_interval=poll_interval,
-            timeout=timeout,
-            page_limit=window_size,
-            remote_url=remote_url,
-            batch_size=batch_size,
-            start_page=start_page,
-            api_base=api_base,
-            model=model,
-        )
+        if console.is_terminal:
+            if window_size <= 0:
+                range_label = "entire document"
+                total_batches_estimate = 1
+            else:
+                end_page = start_page + window_size - 1
+                range_label = f"pages {start_page}-{end_page}"
+                total_batches_estimate = max(1, (window_size + batch_size - 1) // batch_size)
+
+            with Progress(
+                SpinnerColumn(),
+                TextColumn("[progress.description]{task.description}"),
+                BarColumn(),
+                TextColumn(
+                    "{task.completed}/{task.total} batches | Found: {task.fields[found]} entries"
+                ),
+                console=console,
+                transient=True,
+            ) as progress:
+                task_id = progress.add_task(
+                    f"Scanning {range_label}...",
+                    total=total_batches_estimate,
+                    found=len(cumulative_entries),
+                )
+
+                def _progress_callback(
+                    completed_batches: int, total_batches: int, found_entries: int
+                ) -> None:
+                    total = total_batches or total_batches_estimate
+                    progress.update(
+                        task_id,
+                        completed=completed_batches,
+                        total=total,
+                        found=found_entries,
+                        description=f"Scanning {range_label}...",
+                    )
+
+                json_path = fetch_document_json(
+                    pdf_path,
+                    api_key,
+                    poll_interval=poll_interval,
+                    timeout=timeout,
+                    page_limit=window_size,
+                    remote_url=remote_url,
+                    batch_size=batch_size,
+                    start_page=start_page,
+                    api_base=api_base,
+                    model=model,
+                    max_workers=max_workers,
+                    progress_callback=_progress_callback,
+                )
+        else:
+            json_path = fetch_document_json(
+                pdf_path,
+                api_key,
+                poll_interval=poll_interval,
+                timeout=timeout,
+                page_limit=window_size,
+                remote_url=remote_url,
+                batch_size=batch_size,
+                start_page=start_page,
+                api_base=api_base,
+                model=model,
+                max_workers=max_workers,
+            )
 
         try:
             raw_data = load_json(json_path)

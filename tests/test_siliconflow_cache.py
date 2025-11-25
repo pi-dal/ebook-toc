@@ -33,3 +33,16 @@ def test_payload_cache_returns_fingerprint_not_page_number(monkeypatch, tmp_path
     p2, f2 = api._get_or_render_page_payload(pdf, 0)
     assert p2 == payload
     assert f2 == fingerprint
+
+
+def test_lru_cache_evicts_least_recently_used():
+    cache = api.LRUCache(maxsize=2)
+    cache["a"] = 1
+    cache["b"] = 2
+    # Access "a" so that "b" becomes the least recently used entry.
+    _ = cache["a"]
+    cache["c"] = 3
+
+    assert "a" in cache
+    assert "c" in cache
+    assert "b" not in cache

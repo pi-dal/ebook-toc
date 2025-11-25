@@ -4,10 +4,10 @@ from __future__ import annotations
 
 import hashlib
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Iterable
 
 
-def build_page_fingerprint(page: Any, text: str) -> Dict[str, Any]:
+def build_page_fingerprint(page: Any, text: str) -> dict[str, Any]:
     """Return a lightweight fingerprint for *page* given extracted *text*."""
 
     text_clean = text or ""
@@ -37,8 +37,8 @@ def build_page_fingerprint(page: Any, text: str) -> Dict[str, Any]:
 ## The project now relies on dominant size + canonical index mapping for robustness.
 
 
-def dominant_dimensions(fps: Iterable[Dict[str, Any]]) -> Optional[Tuple[int, int]]:
-    counts: Dict[Tuple[int, int], int] = {}
+def dominant_dimensions(fps: Iterable[dict[str, Any]]) -> tuple[int, int] | None:
+    counts: dict[tuple[int, int], int] = {}
     for fp in fps:
         w = fp.get("width")
         h = fp.get("height")
@@ -52,14 +52,14 @@ def dominant_dimensions(fps: Iterable[Dict[str, Any]]) -> Optional[Tuple[int, in
 
 
 def build_canonical_map_for_dims(
-    fps: List[Dict[str, Any]],
-    dims: Tuple[int, int],
-) -> Dict[int, int]:
+    fps: list[dict[str, Any]],
+    dims: tuple[int, int],
+) -> dict[int, int]:
     """Return mapping canonical_index (1-based) -> pdf_page (1-based).
 
     Canonical index increments only on pages whose width/height match *dims*.
     """
-    mapping: Dict[int, int] = {}
+    mapping: dict[int, int] = {}
     canonical = 0
     for pdf_idx, fp in enumerate(fps, start=1):
         w = int(fp.get("width") or 0)
@@ -72,15 +72,15 @@ def build_canonical_map_for_dims(
 
 def compute_pdf_fingerprints(
     pdf_path: Path,
-    limit: Optional[int] = None,
-) -> Tuple[List[Dict[str, Any]], int]:
+    limit: int | None = None,
+) -> tuple[list[dict[str, Any]], int]:
     try:
         import fitz  # type: ignore[import]
     except ImportError as exc:  # pragma: no cover
         raise RuntimeError("PyMuPDF (fitz) is required for fingerprinting") from exc
 
     resolved = Path(pdf_path).expanduser().resolve()
-    fingerprints: List[Dict[str, Any]] = []
+    fingerprints: list[dict[str, Any]] = []
     with fitz.open(resolved) as doc:  # type: ignore[attr-defined]
         page_count = doc.page_count
         end_page = page_count if not limit or limit <= 0 else min(limit, page_count)

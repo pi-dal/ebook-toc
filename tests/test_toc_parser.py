@@ -56,6 +56,29 @@ def test_deduplicate_entries_by_content_and_target():
     assert sorted({i.get("target_page") for i in items}) == [10, 11]
 
 
+def test_deduplicate_entries_handles_chapter_number_variants():
+    raw = [
+        {"page": 1, "content": "第一章 绪论 ...... 1", "target_page": 1},
+        {"page": 2, "content": "第1章 绪论 1", "target_page": 1},
+    ]
+    items = deduplicate_entries(raw)
+    assert len(items) == 1
+
+
+def test_deduplicate_entries_fuzzy_match_recent_entries():
+    raw = [
+        {"page": 1, "content": "第1章 绪论", "target_page": 1},
+        {"page": 2, "content": "第一章 绪论与背景", "target_page": 1},
+    ]
+    # With fuzzy matching, these should collapse into one entry.
+    items = deduplicate_entries(raw, fuzzy_threshold=0.85)
+    assert len(items) == 1
+
+    # Disabling fuzzy matching should keep both (normalisation alone differs).
+    items_no_fuzzy = deduplicate_entries(raw, fuzzy_threshold=None)
+    assert len(items_no_fuzzy) == 2
+
+
 def test_filter_entries_contains_and_regex():
     raw = [
         {"page": 1, "content": "Introduction"},
@@ -70,4 +93,3 @@ def test_filter_entries_contains_and_regex():
 
     items = filter_entries(raw, pattern=re.compile(r"^re", re.I))
     assert [i["page"] for i in items] == [3]
-
