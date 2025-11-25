@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import threading
 
 import ebooktoc.vlm_api as api
 
@@ -46,3 +47,30 @@ def test_lru_cache_evicts_least_recently_used():
     assert "a" in cache
     assert "c" in cache
     assert "b" not in cache
+
+
+def test_lru_cache_set_alias_and_basic_get():
+    cache = api.LRUCache(maxsize=2)
+    cache.set("x", 1)
+    assert cache["x"] == 1
+    # get() should mark the key as recently used without raising.
+    assert cache.get("x") == 1
+
+
+def test_lru_cache_thread_safety_under_concurrent_access():
+    cache = api.LRUCache(maxsize=10)
+
+    def worker(offset: int) -> None:
+        for i in range(100):
+            key = f"k{(i + offset) % 20}"
+            cache[key] = i
+            _ = cache.get(key)
+
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(5)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    # Cache should respect its max size and not raise during concurrent access.
+    assert len(cache) <= 10

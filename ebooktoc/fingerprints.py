@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import concurrent.futures
 import hashlib
+import threading
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 
 def build_page_fingerprint(page: Any, text: str) -> dict[str, Any]:
@@ -73,26 +75,69 @@ def build_canonical_map_for_dims(
 def compute_pdf_fingerprints(
     pdf_path: Path,
     limit: int | None = None,
+    *,
     progress_callback: Callable[[int, int], None] | None = None,
+    max_workers: int = 4,
 ) -> tuple[list[dict[str, Any]], int]:
+    """Compute lightweight fingerprints for pages in a PDF.
+
+    Parameters
+    ----------
+    pdf_path :
+        Path to the source PDF file.
+    limit :
+        Optional upper bound on the number of pages to fingerprint. A value of
+        ``0`` or ``None`` means "all pages".
+    progress_callback :
+        Optional callable receiving ``(completed, total)`` page counts.
+    max_workers :
+        Maximum number of worker threads to use when fingerprinting pages.
+
+    Returns
+    -------
+    list[dict[str, Any]], int
+        A tuple of ``(fingerprints, total_page_count)`` where ``fingerprints``
+        contains one entry per scanned page in order.
+    """
     try:
         import fitz  # type: ignore[import]
     except ImportError as exc:  # pragma: no cover
         raise RuntimeError("PyMuPDF (fitz) is required for fingerprinting") from exc
 
     resolved = Path(pdf_path).expanduser().resolve()
-    fingerprints: list[dict[str, Any]] = []
     with fitz.open(resolved) as doc:  # type: ignore[attr-defined]
         page_count = doc.page_count
-        end_page = page_count if not limit or limit <= 0 else min(limit, page_count)
-        for index in range(end_page):
+
+    end_page = page_count if not limit or limit <= 0 else min(limit, page_count)
+    if end_page <= 0:
+        return [], page_count
+
+    progress_lock = threading.Lock()
+    completed = 0
+
+    def _process_page(index: int) -> dict[str, Any]:
+        nonlocal completed
+        with fitz.open(resolved) as doc:  # type: ignore[attr-defined]
             page = doc.load_page(index)
             text = page.get_text("text").strip()
-            fingerprints.append(build_page_fingerprint(page, text))
-            if progress_callback is not None:
+            fp = build_page_fingerprint(page, text)
+
+        if progress_callback is not None:
+            with progress_lock:
+                completed += 1
                 try:
-                    progress_callback(index + 1, end_page)
+                    progress_callback(completed, end_page)
                 except Exception:
                     # Progress updates are best-effort only.
                     pass
+
+        return fp
+
+    worker_count = max(1, int(max_workers) if max_workers is not None else 1)
+    if worker_count == 1:
+        fingerprints = [_process_page(i) for i in range(end_page)]
+    else:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=worker_count) as executor:
+            fingerprints = list(executor.map(_process_page, range(end_page)))
+
     return fingerprints, page_count

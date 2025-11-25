@@ -54,39 +54,55 @@ class LRUCache(MutableMapping):
     def __init__(self, maxsize: int = DEFAULT_CACHE_SIZE) -> None:
         self.maxsize = maxsize
         self._data: OrderedDict[Any, Any] = OrderedDict()
+        self._lock = threading.Lock()
 
     def __getitem__(self, key: Any) -> Any:
-        value = self._data[key]
-        self._data.move_to_end(key)
-        return value
+        with self._lock:
+            value = self._data[key]
+            self._data.move_to_end(key)
+            return value
 
     def __setitem__(self, key: Any, value: Any) -> None:
-        if key in self._data:
-            self._data.move_to_end(key)
-        self._data[key] = value
-        if len(self._data) > self.maxsize:
-            self._data.popitem(last=False)
+        with self._lock:
+            if key in self._data:
+                self._data.move_to_end(key)
+            self._data[key] = value
+            if len(self._data) > self.maxsize:
+                self._data.popitem(last=False)
+
+    def set(self, key: Any, value: Any) -> None:
+        """Set *key* to *value* (alias for ``__setitem__``)."""
+        self.__setitem__(key, value)
 
     def __delitem__(self, key: Any) -> None:
-        del self._data[key]
+        with self._lock:
+            del self._data[key]
 
     def __iter__(self):
-        return iter(self._data)
+        with self._lock:
+            # Iterate over a snapshot to avoid holding the lock during user loops.
+            return iter(list(self._data.keys()))
 
     def __len__(self) -> int:
-        return len(self._data)
+        with self._lock:
+            return len(self._data)
 
     def clear(self) -> None:
-        self._data.clear()
+        with self._lock:
+            self._data.clear()
 
     def get(self, key: Any, default: Any = None) -> Any:
-        try:
-            return self[key]
-        except KeyError:
+        with self._lock:
+            if key in self._data:
+                value = self._data[key]
+                self._data.move_to_end(key)
+                return value
             return default
 
     def __repr__(self) -> str:  # pragma: no cover - cosmetic
-        return f"{self.__class__.__name__}({list(self._data.items())})"
+        with self._lock:
+            items = list(self._data.items())
+        return f"{self.__class__.__name__}({items})"
 
 
 # Cache maps (pdf_path, index) -> (payload_entry, fingerprint_dict)
@@ -1073,7 +1089,7 @@ def _render_page_payload(
         except ValueError:
             return None, None
 
-        entry: Dict[str, Any] = {"page": index + 1}
+        entry: dict[str, Any] = {"page": index + 1}
 
         text = page.get_text("text").strip()
         fingerprint = build_page_fingerprint(page, text)

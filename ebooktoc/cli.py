@@ -168,6 +168,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="Number of pages to send per VLM request (default: 10).",
     )
     scan_parser.add_argument(
+        "--fuzzy-dedup",
+        type=float,
+        default=0.85,
+        help=(
+            "Fuzzy deduplication threshold in [0.0,1.0] "
+            "(0.0 disables fuzzy matching; default: 0.85)."
+        ),
+    )
+    scan_parser.add_argument(
         "--max-workers",
         type=int,
         default=3,
@@ -473,6 +482,7 @@ def _run_scan(args: argparse.Namespace) -> None:
             max_workers=args.max_workers,
             api_base=args.api_base,
             model=args.model,
+            fuzzy_threshold=args.fuzzy_dedup if args.fuzzy_dedup and args.fuzzy_dedup > 0 else None,
         )
         scan_elapsed = time.perf_counter() - scan_start
         scanned_pages = "all" if used_limit == 0 else str(used_limit)
@@ -1216,38 +1226,106 @@ def _build_clean_pdf(
         clean = fitz.open()  # type: ignore[attr-defined]
         clean_to_original: dict[int, int] = {}
         total = len(keep_indices)
+
+        if not keep_indices:
+            # Nothing to keep; return an empty PDF.
+            import tempfile
+
+
+            tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf", prefix="clean-")
+            tmp.close()
+            clean.save(tmp.name)
+            clean.close()
+            return Path(tmp.name), clean_to_original
+
+        # Merge consecutive indices into ranges so we can insert in batches.
+        sorted_indices = sorted(keep_indices)
+        ranges: list[tuple[int, int]] = []
+        start = end = sorted_indices[0]
+        for idx in sorted_indices[1:]:
+            if idx == end + 1:
+                end = idx
+            else:
+                ranges.append((start, end))
+                start = end = idx
+        ranges.append((start, end))
+
+        clean_idx = 0
+
         if is_interactive():
             with create_progress(
                 "Building clean PDF...", total=total or None
             ) as (progress, task_id):
                 processed = 0
-                for clean_idx, orig_idx in enumerate(keep_indices, start=1):
+                for range_start, range_end in ranges:
                     try:
-                        # Append a copy of the original page to the clean document
+                        # Batch insert a contiguous range of pages.
                         clean.insert_pdf(
-                            src, from_page=orig_idx - 1, to_page=orig_idx - 1
+                            src,
+                            from_page=range_start - 1,
+                            to_page=range_end - 1,
                         )
-                        clean_to_original[clean_idx] = orig_idx
+                        for orig_idx in range(range_start, range_end + 1):
+                            clean_idx += 1
+                            clean_to_original[clean_idx] = orig_idx
+                            processed += 1
+                            progress.update(
+                                task_id,
+                                completed=processed,
+                                total=total or processed,
+                                description=(
+                                    f"Building clean PDF... {processed}/{total} pages"
+                                    if total
+                                    else "Building clean PDF..."
+                                ),
+                            )
                     except Exception:
-                        continue
-                    processed += 1
-                    progress.update(
-                        task_id,
-                        completed=processed,
-                        total=total or processed,
-                        description=(
-                            f"Building clean PDF... {processed}/{total} pages"
-                            if total
-                            else "Building clean PDF..."
-                        ),
-                    )
+                        # Fallback to per-page insertion when bulk insert fails.
+                        for orig_idx in range(range_start, range_end + 1):
+                            try:
+                                clean.insert_pdf(
+                                    src,
+                                    from_page=orig_idx - 1,
+                                    to_page=orig_idx - 1,
+                                )
+                                clean_idx += 1
+                                clean_to_original[clean_idx] = orig_idx
+                                processed += 1
+                                progress.update(
+                                    task_id,
+                                    completed=processed,
+                                    total=total or processed,
+                                    description=(
+                                        f"Building clean PDF... {processed}/{total} pages"
+                                        if total
+                                        else "Building clean PDF..."
+                                    ),
+                                )
+                            except Exception:
+                                continue
         else:
-            for clean_idx, orig_idx in enumerate(keep_indices, start=1):
+            for range_start, range_end in ranges:
                 try:
-                    clean.insert_pdf(src, from_page=orig_idx - 1, to_page=orig_idx - 1)
-                    clean_to_original[clean_idx] = orig_idx
+                    clean.insert_pdf(
+                        src,
+                        from_page=range_start - 1,
+                        to_page=range_end - 1,
+                    )
+                    for orig_idx in range(range_start, range_end + 1):
+                        clean_idx += 1
+                        clean_to_original[clean_idx] = orig_idx
                 except Exception:
-                    continue
+                    for orig_idx in range(range_start, range_end + 1):
+                        try:
+                            clean.insert_pdf(
+                                src,
+                                from_page=orig_idx - 1,
+                                to_page=orig_idx - 1,
+                            )
+                            clean_idx += 1
+                            clean_to_original[clean_idx] = orig_idx
+                        except Exception:
+                            continue
 
         # Save to a temporary file
         import tempfile
@@ -1389,6 +1467,7 @@ def _scan_with_adaptive_pages(
     auto_expand: bool,
     contains: str | None,
     pattern: re.Pattern[str] | None,
+    fuzzy_threshold: float | None,
     batch_size: int,
     max_workers: int,
     api_base: str | None,
@@ -1421,7 +1500,10 @@ def _scan_with_adaptive_pages(
                 return (
                     infer_missing_targets(
                         filter_entries(
-                            deduplicate_entries(cumulative_entries),
+                            deduplicate_entries(
+                                cumulative_entries,
+                                fuzzy_threshold=fuzzy_threshold,
+                            ),
                             contains=contains,
                             pattern=pattern,
                         )
@@ -1513,7 +1595,10 @@ def _scan_with_adaptive_pages(
         cumulative_entries.extend(batch_entries)
         cumulative_fingerprints.extend(batch_fingerprints)
 
-        processed_entries = deduplicate_entries(cumulative_entries)
+        processed_entries = deduplicate_entries(
+            cumulative_entries,
+            fuzzy_threshold=fuzzy_threshold,
+        )
         processed_entries = filter_entries(
             processed_entries,
             contains=contains,

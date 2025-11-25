@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any, Iterable, Pattern, Set
+from typing import Any, Iterable, Pattern
 import re
 import difflib
 import unicodedata
@@ -161,7 +161,7 @@ def deduplicate_entries(
         When ``None``, only exact normalised matches are deduplicated.
     """
 
-    seen_exact: Set[tuple[str, Any]] = set()
+    seen_exact: set[tuple[str, Any]] = set()
     history: list[tuple[str, Any]] = []
     deduped: list[dict[str, Any]] = []
 

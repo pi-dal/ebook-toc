@@ -4,6 +4,7 @@ from ebooktoc.toc_parser import (
     extract_toc_entries,
     deduplicate_entries,
     filter_entries,
+    _normalize_for_comparison,
 )
 
 
@@ -77,6 +78,15 @@ def test_deduplicate_entries_fuzzy_match_recent_entries():
     # Disabling fuzzy matching should keep both (normalisation alone differs).
     items_no_fuzzy = deduplicate_entries(raw, fuzzy_threshold=None)
     assert len(items_no_fuzzy) == 2
+
+
+def test_normalize_for_comparison_strips_prefix_and_trailing_page():
+    s1 = "第一章 绪论 ...... 1"
+    s2 = "第1章 绪论 1"
+    n1 = _normalize_for_comparison(s1)
+    n2 = _normalize_for_comparison(s2)
+    assert n1 == n2
+    assert "绪论" in n1
 
 
 def test_filter_entries_contains_and_regex():
