@@ -91,14 +91,14 @@ You can rerun bookmark creation later with `ebook-toc apply`, passing the previo
 ## How It Works
 
 - Input handling (`ebooktoc/cli.py`): validates local files or downloads remote PDFs; optionally creates a GoodNotes‑cleaned copy by keeping only dominant page sizes.
-- Page extraction (`ebooktoc/siliconflow_api.py`): extracts per‑page text (or renders JPEG when text is empty), batches VLM requests, and parses JSON robustly.
+- Page extraction (`ebooktoc/vlm_api.py`): extracts per‑page text (or renders JPEG when text is empty), batches VLM requests, and parses JSON robustly.
 - TOC parsing (`ebooktoc/toc_parser.py`): normalizes entries, deduplicates, filters, and infers missing trailing numeric targets.
 - Offset and mapping (`ebooktoc/fingerprints.py`, `ebooktoc/cli.py`): computes dominant dimensions, builds a canonical index map (logical → PDF), and estimates printed‑page offsets by sampling pages with the VLM; stores `toc`, `page_offset`, `fingerprints`, and `page_map` in JSON.
 - Apply phase (`ebooktoc/pdf_writer.py`, `ebooktoc/cli.py`): rebuilds the canonical map, refines the offset, resolves target pages, and writes bookmarks.
 
 Primary modules:
 - `ebooktoc/cli.py`: CLI commands (`scan`, `apply`), coordination, prompts, and IO
-- `ebooktoc/siliconflow_api.py`: batching, VLM calls, JSON parsing, offset estimation
+- `ebooktoc/vlm_api.py`: batching, VLM calls, JSON parsing, offset estimation
 - `ebooktoc/toc_parser.py`: TOC normalization, deduplication, filtering, heuristics
 - `ebooktoc/fingerprints.py`: dominant‑dimension detection and canonical index mapping
 - `ebooktoc/pdf_writer.py`: bookmark embedding and result reporting

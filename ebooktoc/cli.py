@@ -19,7 +19,7 @@ from .fingerprints import (
     build_canonical_map_for_dims,
 )
 from .pdf_writer import write_pdf_toc
-from .siliconflow_api import TOCExtractionError, fetch_document_json, _infer_page_offset
+from .vlm_api import TOCExtractionError, fetch_document_json, _infer_page_offset
 from .toc_parser import (
     deduplicate_entries,
     extract_toc_entries,
@@ -822,8 +822,8 @@ def _run_apply(args: argparse.Namespace) -> None:
                 args.api_key,
                 args.timeout,
                 current_fps,
-                api_base=getattr(args, "api_base", None),
-                model=getattr(args, "model", None),
+                api_base=args.api_base,
+                model=args.model,
             )
             if vlm_offset is not None:
                 refined_offset = vlm_offset
@@ -880,8 +880,8 @@ def _run_apply(args: argparse.Namespace) -> None:
                     resolved_entries,
                     getattr(args, 'api_key', None),
                     getattr(args, 'timeout', 600),
-                    api_base=getattr(args, "api_base", None),
-                    model=getattr(args, "model", None),
+                    api_base=args.api_base,
+                    model=args.model,
                     window=max(1, int(getattr(args, 'verify_window', 6))),
                     max_checks=max(10, int(getattr(args, 'verify_max', 80))),
                 )
@@ -1079,7 +1079,7 @@ def _adjust_entries_by_printed(
     if not api_key:
         return entries
     try:
-        from .siliconflow_api import _get_printed_page_number
+        from .vlm_api import _get_printed_page_number
     except Exception:
         return entries
 

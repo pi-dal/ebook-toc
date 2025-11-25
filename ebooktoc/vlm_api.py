@@ -1,4 +1,9 @@
-"""SiliconFlow Qwen API client for extracting TOC data from PDFs."""
+"""VLM API client for extracting TOC data from PDFs.
+
+This module exposes an OpenAI Chat Completions–style client that defaults to
+SiliconFlow's Qwen3‑VL‑32B‑Instruct model but can be pointed at any
+OpenAI‑compatible VLM backend via ``api_base`` and ``model`` parameters.
+"""
 
 from __future__ import annotations
 
@@ -59,9 +64,9 @@ def fetch_document_json(
     pdf_path :
         Local PDF path when ``remote_url`` is not provided.
     api_key :
-        SiliconFlow API token.
+        VLM API token (e.g., SiliconFlow or OpenRouter).
     poll_interval, timeout :
-        Retained for CLI compatibility; not used by the SiliconFlow workflow.
+        Retained for CLI compatibility; not used by the streaming workflow.
     page_limit :
         Maximum number of pages to scan from the requested window. A value of
         ``0`` means \"from ``start_page`` to the end of the document\".
@@ -413,18 +418,6 @@ def _call_chat_completion(
     return body
 
 
-def _is_retryable_error(exc: TOCExtractionError) -> bool:
-    cause = exc.__cause__
-    if isinstance(cause, requests.HTTPError) and cause.response is not None:
-        status = cause.response.status_code
-        if status == 429 or 500 <= status < 600:
-            return True
-    # Treat common transient network failures as retryable as well.
-    if isinstance(cause, (requests.Timeout, requests.ConnectionError)):
-        return True
-    return False
-
-
 def _parse_response_payload(body: Dict[str, Any]) -> List[Dict[str, Any]]:
     choices = body.get("choices")
     if not choices:
@@ -439,12 +432,7 @@ def _parse_response_payload(body: Dict[str, Any]) -> List[Dict[str, Any]]:
     try:
         data = json.loads(json_text)
     except json.JSONDecodeError as exc:
-        # Best-effort repair for slightly invalid JSON coming back from the model.
-        # In practice we sometimes see unquoted or single-quoted keys like
-        #   {page: 11, target_page: 67, content: "Title"}
-        # even though the response is supposed to be strict JSON. When this happens
-        # we attempt to quote the known keys and parse again; if that still fails we
-        # surface the original error.
+        # Try a best-effort repair pass before giving up.
         repaired = _repair_toc_json(json_text)
         if repaired is None:
             raise TOCExtractionError(
@@ -458,8 +446,8 @@ def _parse_response_payload(body: Dict[str, Any]) -> List[Dict[str, Any]]:
             toc = data["toc"]
         elif "output" in data and isinstance(data["output"], list):
             toc = data["output"]
-        # Some SiliconFlow responses occasionally return a single TOC-like
-        # object instead of wrapping it in a {\"toc\": [...]} container.
+        # If the model returns a single entry object (with page/content), accept it
+        # instead of wrapping it in a {\"toc\": [...]} container.
         # When we see a mapping that looks like one TOC entry, treat it as a
         # singleton list rather than failing hard.
         elif "page" in data and "content" in data:
@@ -701,7 +689,7 @@ def _infer_page_offset(
         if dominant_dims:
             canonical_map = build_canonical_map_for_dims(fingerprints, dominant_dims)
             total_canonical = len(canonical_map)
-            for frac in (1/3, 1/2, 2/3):
+            for frac in (1 / 3, 1 / 2, 2 / 3):
                 if total_canonical == 0:
                     break
                 ci = max(1, min(total_canonical, int(round(total_canonical * frac))))
@@ -984,3 +972,4 @@ def _safe_unlink(path: Path) -> None:
         return
     except OSError:
         pass
+

@@ -4,8 +4,8 @@ import json
 
 import requests
 
-import ebooktoc.siliconflow_api as api
-from ebooktoc.siliconflow_api import (
+import ebooktoc.vlm_api as api
+from ebooktoc.vlm_api import (
     _extract_json_block,
     _find_json_substring,
     _parse_response_payload,
@@ -131,11 +131,13 @@ def test_fetch_document_json_page_map_respects_start_page(monkeypatch, tmp_path)
         ]
         return payloads, fps
 
-    def fake_call(api_key, payload, request_timeout):
+    def fake_call(api_key, payload, request_timeout, **kwargs):
         # Minimal SiliconFlow-style body; content is strict JSON.
         return {"choices": [{"message": {"content": '{"toc": []}'}}]}
 
-    def fake_infer_offset(pdf_path, entries, api_key, timeout, fingerprints, max_samples=3):
+    def fake_infer_offset(
+        pdf_path, entries, api_key, timeout, fingerprints, max_samples=3, **kwargs
+    ):
         return None
 
     monkeypatch.setattr(api, "_collect_page_payloads", fake_collect)

@@ -1,7 +1,7 @@
 # Repository Guidelines
 
 ## Project Structure & Module Organization
-Core code lives in `ebooktoc/`: `cli.py` handles argument parsing, `toc_parser.py` cleans SiliconFlow responses, `siliconflow_api.py` speaks to the API, `pdf_writer.py` embeds bookmarks, and `utils.py` hosts filesystem helpers. Generated artifacts belong in `output/json` or `output/pdf` so the repository root stays clean. `pyproject.toml` and `pdm.lock` define dependencies and the `ebook-toc` script entry.
+Core code lives in `ebooktoc/`: `cli.py` handles argument parsing, `toc_parser.py` cleans SiliconFlow responses, `vlm_api.py` speaks to the VLM API, `pdf_writer.py` embeds bookmarks, and `utils.py` hosts filesystem helpers. Generated artifacts belong in `output/json` or `output/pdf` so the repository root stays clean. `pyproject.toml` and `pdm.lock` define dependencies and the `ebook-toc` script entry.
 
 ## Build, Test, and Development Commands
 - `pdm install` – install the Python 3.9+ environment declared in `pyproject.toml`.

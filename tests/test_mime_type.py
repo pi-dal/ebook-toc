@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from ebooktoc.siliconflow_api import _build_payload
+from ebooktoc.vlm_api import _build_payload
 
 
 def test_build_payload_uses_jpeg_mime_for_images():
@@ -17,4 +17,3 @@ def test_build_payload_uses_jpeg_mime_for_images():
     assert image_items, "No image_url found in constructed payload"
     url = image_items[0]["image_url"]["url"]
     assert url.startswith("data:image/jpeg;base64,"), url
-
