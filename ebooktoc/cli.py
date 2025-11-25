@@ -36,7 +36,10 @@ console = Console()
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="ebook-toc",
-        description="Scan a PDF with SiliconFlow Qwen and extract table-of-contents entries.",
+        description=(
+            "Scan a PDF with an OpenAI-format VLM (default: SiliconFlow Qwen) "
+            "and extract table-of-contents entries."
+        ),
     )
     parser.add_argument(
         "--version",
@@ -63,7 +66,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     scan_parser = subparsers.add_parser(
         "scan",
-        help="Upload or download a PDF, call SiliconFlow Qwen, and export TOC JSON.",
+        help=(
+            "Upload or download a PDF, call an OpenAI-format VLM "
+            "(default: SiliconFlow Qwen), and export TOC JSON."
+        ),
     )
     scan_parser.add_argument(
         "pdf",
@@ -76,13 +82,31 @@ def build_parser() -> argparse.ArgumentParser:
         "--api-key",
         "-k",
         required=True,
-        help="SiliconFlow API token.",
+        help="VLM API token (OpenAI-format; default backend is SiliconFlow).",
+    )
+    scan_parser.add_argument(
+        "--api-base",
+        type=str,
+        default=None,
+        help=(
+            "OpenAI-compatible API base URL (e.g. https://api.siliconflow.cn/v1 "
+            "or https://api.openai.com/v1). Defaults to SiliconFlow."
+        ),
+    )
+    scan_parser.add_argument(
+        "--model",
+        type=str,
+        default=None,
+        help=(
+            "VLM model name in OpenAI format "
+            "(default: Qwen/Qwen3-VL-32B-Instruct)."
+        ),
     )
     scan_parser.add_argument(
         "--remote-url",
         type=str,
         default=None,
-        help="Remote PDF URL to download before calling SiliconFlow.",
+        help="Remote PDF URL to download before calling the VLM.",
     )
     scan_parser.add_argument(
         "--output",
@@ -101,7 +125,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--timeout",
         type=int,
         default=600,
-        help="SiliconFlow request timeout in seconds (default: 600).",
+        help="VLM request timeout in seconds (default: 600).",
     )
     scan_parser.add_argument(
         "--pages",
@@ -125,7 +149,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--batch-size",
         type=int,
         default=3,
-        help="Number of pages to send per SiliconFlow request (default: 3).",
+        help="Number of pages to send per VLM request (default: 3).",
     )
     scan_parser.add_argument(
         "--save-json",
@@ -206,13 +230,31 @@ def build_parser() -> argparse.ArgumentParser:
         "-k",
         type=str,
         default=None,
-        help="SiliconFlow API token (optional; improves offset inference on apply).",
+        help="VLM API token (optional; improves offset inference on apply).",
+    )
+    apply_parser.add_argument(
+        "--api-base",
+        type=str,
+        default=None,
+        help=(
+            "OpenAI-compatible API base URL used for offset refinement "
+            "(defaults to SiliconFlow when omitted)."
+        ),
+    )
+    apply_parser.add_argument(
+        "--model",
+        type=str,
+        default=None,
+        help=(
+            "VLM model name used for offset/verification "
+            "(default: Qwen/Qwen3-VL-32B-Instruct)."
+        ),
     )
     apply_parser.add_argument(
         "--timeout",
         type=int,
         default=600,
-        help="SiliconFlow request timeout in seconds (default: 600).",
+        help="VLM request timeout in seconds (default: 600).",
     )
     apply_parser.add_argument(
         "--override-offset",
@@ -385,12 +427,14 @@ def _run_scan(args: argparse.Namespace) -> None:
             contains=args.filter_contains,
             pattern=pattern,
             batch_size=args.batch_size,
+            api_base=args.api_base,
+            model=args.model,
         )
     except TOCExtractionError as err:
         console.print(f"[red]{err}[/]")
         raise SystemExit(2) from err
     except requests.RequestException as err:
-        console.print(f"[red]Network error while calling SiliconFlow: {err}[/]")
+        console.print(f"[red]Network error while calling the VLM API: {err}[/]")
         raise SystemExit(3) from err
     finally:
         # Clean up temporary clean PDF and downloaded file if created
@@ -775,6 +819,8 @@ def _run_apply(args: argparse.Namespace) -> None:
                 args.api_key,
                 args.timeout,
                 current_fps,
+                api_base=getattr(args, "api_base", None),
+                model=getattr(args, "model", None),
             )
             if vlm_offset is not None:
                 refined_offset = vlm_offset
@@ -831,6 +877,8 @@ def _run_apply(args: argparse.Namespace) -> None:
                     resolved_entries,
                     getattr(args, 'api_key', None),
                     getattr(args, 'timeout', 600),
+                    api_base=getattr(args, "api_base", None),
+                    model=getattr(args, "model", None),
                     window=max(1, int(getattr(args, 'verify_window', 6))),
                     max_checks=max(10, int(getattr(args, 'verify_max', 80))),
                 )
@@ -1020,6 +1068,8 @@ def _adjust_entries_by_printed(
     entries: list[dict[str, Any]],
     api_key: Optional[str],
     timeout: int,
+    api_base: Optional[str] = None,
+    model: Optional[str] = None,
     window: int = 6,
     max_checks: int = 80,
 ) -> list[dict[str, Any]]:
@@ -1052,7 +1102,14 @@ def _adjust_entries_by_printed(
         # Conservative: only adjust on exact printed-page match, nearest to guess
         exact_matches: list[int] = []
         for p in range(max(1, guess - window), guess + window + 1):
-            pn = _get_printed_page_number(pdf_path, p - 1, api_key, timeout)
+            pn = _get_printed_page_number(
+                pdf_path,
+                p - 1,
+                api_key,
+                timeout,
+                api_base=api_base,
+                model=model,
+            )
             if pn is None:
                 continue
             if int(pn) == int(e.get("target_page") or 0):
@@ -1084,6 +1141,8 @@ def _scan_with_adaptive_pages(
     contains: Optional[str],
     pattern: Optional[re.Pattern[str]],
     batch_size: int,
+    api_base: Optional[str],
+    model: Optional[str],
 ) -> tuple[list[dict[str, Any]], int, Optional[int], list[dict[str, Any]]]:
     current_limit = max(initial_limit, 0)
     effective_step = max(step, 1)
@@ -1101,6 +1160,8 @@ def _scan_with_adaptive_pages(
             page_limit=current_limit,
             remote_url=remote_url,
             batch_size=batch_size,
+            api_base=api_base,
+            model=model,
         )
 
         try:

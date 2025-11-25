@@ -17,9 +17,13 @@ from .fingerprints import (
     dominant_dimensions,
     build_canonical_map_for_dims,
 )
-from .utils import coerce_positive_int as _util_coerce_positive_int, download_to_temp as _util_download_to_temp
+from .utils import (
+    coerce_positive_int as _util_coerce_positive_int,
+    download_to_temp as _util_download_to_temp,
+)
 
-CHAT_ENDPOINT = "https://api.siliconflow.cn/v1/chat/completions"
+# Default OpenAI-compatible VLM configuration (SiliconFlow as the default backend)
+API_BASE_DEFAULT = "https://api.siliconflow.cn/v1"
 MODEL_NAME = "Qwen/Qwen3-VL-32B-Instruct"
 DEFAULT_BATCH_SIZE = 3
 JPEG_QUALITY = 80
@@ -43,27 +47,33 @@ def fetch_document_json(
     task_id: Optional[str] = None,
     *,
     batch_size: int = DEFAULT_BATCH_SIZE,
+    api_base: Optional[str] = None,
+    model: Optional[str] = None,
 ) -> Path:
-    """Extract TOC data using SiliconFlow's Qwen/Qwen3-VL-32B-Instruct model.
+    """Extract TOC data using an OpenAI-format VLM API (default: SiliconFlow Qwen).
 
     Returns a temporary JSON file path containing the model output.
     """
 
     if task_id is not None:
-        raise TOCExtractionError("SiliconFlow workflow does not support --task-id")
+        raise TOCExtractionError("VLM workflow does not support --task-id")
 
     source_path, cleanup_required = _resolve_source_pdf(pdf_path, remote_url)
     try:
         page_payloads, fingerprints = _collect_page_payloads(source_path, page_limit)
         aggregated: List[Dict[str, Any]] = []
+        effective_model = model or MODEL_NAME
 
         effective_batch = max(1, batch_size)
         for batch_index, batch in enumerate(
             _chunk_iterable(page_payloads, effective_batch), start=1
         ):
-            payload = _build_payload(batch, page_limit)
+            payload = _build_payload(batch, page_limit, model=effective_model)
             response_body = _call_chat_completion(
-                api_key, payload, request_timeout=timeout
+                api_key,
+                payload,
+                request_timeout=timeout,
+                api_base=api_base,
             )
             toc_json = _parse_response_payload(response_body)
             aggregated.extend(toc_json)
@@ -75,6 +85,8 @@ def fetch_document_json(
                 api_key,
                 timeout,
                 fingerprints,
+                api_base=api_base,
+                model=effective_model,
             )
         except TOCExtractionError:
             offset = None
@@ -160,7 +172,11 @@ def _collect_page_payloads(pdf_path: Path, max_pages: int) -> Tuple[List[Dict[st
     return payloads, fingerprints
 
 
-def _build_payload(page_payloads: List[Dict[str, Any]], max_pages: int) -> Dict[str, Any]:
+def _build_payload(
+    page_payloads: List[Dict[str, Any]],
+    max_pages: int,
+    model: Optional[str] = None,
+) -> Dict[str, Any]:
     instructions = (
         "You are an assistant that extracts a book's table of contents from PDF content. "
         "For every TOC line, output an object with keys: "
@@ -221,7 +237,7 @@ def _build_payload(page_payloads: List[Dict[str, Any]], max_pages: int) -> Dict[
     ]
 
     return {
-        "model": MODEL_NAME,
+        "model": model or MODEL_NAME,
         "temperature": 0.2,
         "messages": messages,
         "response_format": {"type": "json_object"},
@@ -229,44 +245,51 @@ def _build_payload(page_payloads: List[Dict[str, Any]], max_pages: int) -> Dict[
 
 
 def _call_chat_completion(
-    api_key: str, payload: Dict[str, Any], request_timeout: int
+    api_key: str,
+    payload: Dict[str, Any],
+    request_timeout: int,
+    api_base: Optional[str] = None,
 ) -> Dict[str, Any]:
+    base = (api_base or API_BASE_DEFAULT).rstrip("/")
+    endpoint = f"{base}/chat/completions"
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
     }
     try:
         response = requests.post(
-            CHAT_ENDPOINT, json=payload, headers=headers, timeout=request_timeout
+            endpoint, json=payload, headers=headers, timeout=request_timeout
         )
         response.raise_for_status()
     except requests.HTTPError as exc:
         detail = _safe_json(exc.response) if exc.response is not None else str(exc)
-        raise TOCExtractionError(f"SiliconFlow error: {detail}") from exc
+        raise TOCExtractionError(f"VLM API error: {detail}") from exc
     except requests.RequestException as exc:
-        raise TOCExtractionError(f"Failed to call SiliconFlow: {exc}") from exc
+        raise TOCExtractionError(f"Failed to call VLM API: {exc}") from exc
 
     body = response.json()
     if not isinstance(body, dict):
-        raise TOCExtractionError("Unexpected SiliconFlow response format")
+        raise TOCExtractionError("Unexpected VLM API response format")
     return body
 
 
 def _parse_response_payload(body: Dict[str, Any]) -> List[Dict[str, Any]]:
     choices = body.get("choices")
     if not choices:
-        raise TOCExtractionError(f"SiliconFlow response missing choices: {body}")
+        raise TOCExtractionError(f"VLM API response missing choices: {body}")
 
     message = choices[0].get("message", {})
     content = message.get("content")
     if not isinstance(content, str):
-        raise TOCExtractionError(f"SiliconFlow response missing text content: {message}")
+        raise TOCExtractionError(f"VLM API response missing text content: {message}")
 
     json_text = _extract_json_block(content)
     try:
         data = json.loads(json_text)
     except json.JSONDecodeError as exc:
-        raise TOCExtractionError(f"Failed to parse SiliconFlow JSON output: {exc}\nRaw: {json_text}") from exc
+        raise TOCExtractionError(
+            f"Failed to parse VLM JSON output: {exc}\nRaw: {json_text}"
+        ) from exc
 
     toc: Any
     if isinstance(data, dict):
@@ -276,7 +299,7 @@ def _parse_response_payload(body: Dict[str, Any]) -> List[Dict[str, Any]]:
             toc = data["output"]
         else:
             raise TOCExtractionError(
-                f"SiliconFlow response missing 'toc' key: {json_text}"
+                f"VLM API response missing 'toc' key: {json_text}"
             )
     elif isinstance(data, list):
         toc = data
@@ -352,6 +375,8 @@ def _infer_page_offset(
     timeout: int,
     fingerprints: Optional[List[Dict[str, Any]]] = None,
     max_samples: int = 3,
+    api_base: Optional[str] = None,
+    model: Optional[str] = None,
 ) -> Optional[int]:
     if not entries:
         return None
@@ -418,7 +443,14 @@ def _infer_page_offset(
     for canonical_idx, index0 in cano_pdf_pairs:
         if index0 < 0 or index0 >= page_count:
             continue
-        page_number = _get_printed_page_number(resolved, index0, api_key, timeout)
+        page_number = _get_printed_page_number(
+            resolved,
+            index0,
+            api_key,
+            timeout,
+            api_base=api_base,
+            model=model,
+        )
         if page_number is None:
             continue
         # offset aligns printed page to canonical index: canonical = printed + offset
@@ -439,6 +471,8 @@ def _get_printed_page_number(
     index: int,
     api_key: str,
     timeout: int,
+    api_base: Optional[str] = None,
+    model: Optional[str] = None,
 ) -> Optional[int]:
     cache_key = (str(pdf_path), index)
     with _CACHE_LOCK:
@@ -452,7 +486,13 @@ def _get_printed_page_number(
             _PAGE_NUMBER_CACHE[cache_key] = None
         return None
 
-    result = _query_page_number(api_key, image_b64, timeout)
+    result = _query_page_number(
+        api_key,
+        image_b64,
+        timeout,
+        api_base=api_base,
+        model=model,
+    )
     with _CACHE_LOCK:
         _PAGE_NUMBER_CACHE[cache_key] = result
     return result
@@ -477,7 +517,13 @@ def _render_page_image_base64(pdf_path: Path, index: int) -> Optional[str]:
     return base64.b64encode(image_bytes).decode("ascii") if image_bytes else None
 
 
-def _query_page_number(api_key: str, image_b64: str, timeout: int) -> Optional[int]:
+def _query_page_number(
+    api_key: str,
+    image_b64: str,
+    timeout: int,
+    api_base: Optional[str] = None,
+    model: Optional[str] = None,
+) -> Optional[int]:
     instructions = (
         "You are given an image of a book page. Identify the printed page number "
         "visible on the page. Respond with a JSON object {\"page_number\": <number or null>} "
@@ -496,7 +542,7 @@ def _query_page_number(api_key: str, image_b64: str, timeout: int) -> Optional[i
     ]
 
     payload = {
-        "model": MODEL_NAME,
+        "model": model or MODEL_NAME,
         "temperature": 0,
         "messages": [
             {"role": "system", "content": instructions},
@@ -506,7 +552,12 @@ def _query_page_number(api_key: str, image_b64: str, timeout: int) -> Optional[i
     }
 
     try:
-        body = _call_chat_completion(api_key, payload, request_timeout=timeout)
+        body = _call_chat_completion(
+            api_key,
+            payload,
+            request_timeout=timeout,
+            api_base=api_base,
+        )
     except TOCExtractionError:
         return None
 
