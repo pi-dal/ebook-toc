@@ -7,6 +7,7 @@ import concurrent.futures
 import json
 import tempfile
 import threading
+import time
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
@@ -47,12 +48,41 @@ def fetch_document_json(
     task_id: Optional[str] = None,
     *,
     batch_size: int = DEFAULT_BATCH_SIZE,
+    start_page: int = 1,
     api_base: Optional[str] = None,
     model: Optional[str] = None,
 ) -> Path:
     """Extract TOC data using an OpenAI-format VLM API (default: SiliconFlow Qwen).
 
-    Returns a temporary JSON file path containing the model output.
+    Parameters
+    ----------
+    pdf_path :
+        Local PDF path when ``remote_url`` is not provided.
+    api_key :
+        SiliconFlow API token.
+    poll_interval, timeout :
+        Retained for CLI compatibility; not used by the SiliconFlow workflow.
+    page_limit :
+        Maximum number of pages to scan from the requested window. A value of
+        ``0`` means \"from ``start_page`` to the end of the document\".
+    remote_url :
+        Optional remote PDF URL to download before scanning. When supplied,
+        ``pdf_path`` is ignored.
+    task_id :
+        Not supported by this workflow; passing a value raises
+        :class:`TOCExtractionError`.
+    batch_size :
+        Number of page payloads to include in each chat completion request.
+    start_page :
+        1-based starting page for the scan window. Callers can advance this
+        between invocations to implement incremental or windowed scanning.
+
+    Returns
+    -------
+    Path
+        Path to a temporary JSON file containing the model output. The JSON
+        object includes at least ``\"toc\"``, ``\"page_offset\"``,
+        ``\"fingerprints\"``, and ``\"page_map\"`` keys.
     """
 
     if task_id is not None:
@@ -60,23 +90,54 @@ def fetch_document_json(
 
     source_path, cleanup_required = _resolve_source_pdf(pdf_path, remote_url)
     try:
-        page_payloads, fingerprints = _collect_page_payloads(source_path, page_limit)
+        page_payloads, fingerprints = _collect_page_payloads(
+            source_path, page_limit, start_page=start_page
+        )
         aggregated: List[Dict[str, Any]] = []
         effective_model = model or MODEL_NAME
 
         effective_batch = max(1, batch_size)
-        for batch_index, batch in enumerate(
-            _chunk_iterable(page_payloads, effective_batch), start=1
-        ):
-            payload = _build_payload(batch, page_limit, model=effective_model)
-            response_body = _call_chat_completion(
-                api_key,
-                payload,
-                request_timeout=timeout,
-                api_base=api_base,
-            )
-            toc_json = _parse_response_payload(response_body)
-            aggregated.extend(toc_json)
+        batches: List[List[Dict[str, Any]]] = list(
+            _chunk_iterable(page_payloads, effective_batch)
+        )
+
+        if batches:
+            max_attempts = 3
+
+            def _fetch_toc_for_batch(
+                batch: List[Dict[str, Any]]
+            ) -> List[Dict[str, Any]]:
+                attempts = 0
+                last_error: Optional[Exception] = None
+                while attempts < max_attempts:
+                    attempts += 1
+                    payload = _build_payload(
+                        batch, page_limit, start_page=start_page, model=effective_model
+                    )
+                    try:
+                        response_body = _call_chat_completion(
+                            api_key, payload, request_timeout=timeout, api_base=api_base
+                        )
+                        return _parse_response_payload(response_body)
+                    except TOCExtractionError as exc:
+                        last_error = exc
+                        if attempts >= max_attempts or not _is_retryable_error(exc):
+                            raise
+                        # Simple exponential backoff capped at 5 seconds
+                        sleep_seconds = min(2 ** (attempts - 1), 5)
+                        time.sleep(sleep_seconds)
+
+                # Should not be reached because we either return or raise above
+                if last_error is not None:
+                    raise last_error
+                raise RuntimeError(
+                    "Unexpected code path reached in _fetch_toc_for_batch"
+                )
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
+                for toc_json in executor.map(_fetch_toc_for_batch, batches):
+                    aggregated.extend(toc_json)
+
         offset = None
         try:
             offset = _infer_page_offset(
@@ -95,7 +156,16 @@ def fetch_document_json(
         page_map: Dict[int, int] = {}
         dims = dominant_dimensions(fingerprints) if fingerprints else None
         if dims:
-            page_map = build_canonical_map_for_dims(fingerprints, dims)
+            raw_map = build_canonical_map_for_dims(fingerprints, dims)
+            # When scanning from a non-first page, fingerprints only cover a
+            # window of the document. Adjust the pdf_page values so they are
+            # expressed in absolute 1-based page numbers rather than
+            # window-relative indices.
+            if start_page > 1 and raw_map:
+                offset = start_page - 1
+                page_map = {canon: page + offset for canon, page in raw_map.items()}
+            else:
+                page_map = raw_map
 
         packaged = {
             "toc": aggregated,
@@ -132,7 +202,28 @@ def _download_remote_pdf(url: str) -> Path:
         raise TOCExtractionError(f"Failed to download remote PDF: {exc}") from exc
 
 
-def _collect_page_payloads(pdf_path: Path, max_pages: int) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+def _collect_page_payloads(
+    pdf_path: Path,
+    max_pages: int,
+    *,
+    start_page: int = 1,
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Collect payloads and fingerprints for a window of PDF pages.
+
+    The window is defined by a 1-based ``start_page`` and a maximum number of
+    pages ``max_pages``. If ``max_pages`` is less than or equal to zero, all
+    pages from ``start_page`` to the end of the document are considered. When
+    the requested window lies entirely past the end of the document, this
+    function returns empty lists instead of raising an error so callers can
+    treat it as "no pages left to scan".
+
+    Raises
+    ------
+    TOCExtractionError
+        If the PDF cannot be opened, contains no pages, or there are pages in
+        the requested window but none can be extracted (no text or renderable
+        images).
+    """
     try:
         import fitz  # type: ignore[import]
     except ImportError as exc:  # pragma: no cover - dependency issue
@@ -147,14 +238,25 @@ def _collect_page_payloads(pdf_path: Path, max_pages: int) -> Tuple[List[Dict[st
     if total_pages == 0:
         raise TOCExtractionError("PDF contains no pages")
 
-    end_page = total_pages if max_pages <= 0 else min(max_pages, total_pages)
+    # Convert 1-based start_page to 0-based index and clamp at 0
+    start_index = max(0, start_page - 1)
+    if max_pages <= 0:
+        end_page = total_pages
+    else:
+        end_page = min(total_pages, start_index + max_pages)
+
+    # When the requested window lies entirely past the end of the document,
+    # treat this as "no pages left to scan" rather than a hard failure.
+    if start_index >= end_page:
+        return [], []
+
     payloads: List[Dict[str, Any]] = []
     fingerprints: List[Dict[str, Any]] = []
 
     with concurrent.futures.ThreadPoolExecutor() as executor:
         futures = [
             executor.submit(_get_or_render_page_payload, resolved, index)
-            for index in range(end_page)
+            for index in range(start_index, end_page)
         ]
 
         for future in futures:
@@ -175,8 +277,35 @@ def _collect_page_payloads(pdf_path: Path, max_pages: int) -> Tuple[List[Dict[st
 def _build_payload(
     page_payloads: List[Dict[str, Any]],
     max_pages: int,
+    start_page: int = 1,
     model: Optional[str] = None,
 ) -> Dict[str, Any]:
+    """Build the chat-completion payload for a window of pages.
+
+    Parameters
+    ----------
+    page_payloads :
+        List of per-page payload dictionaries produced by
+        :func:`_collect_page_payloads` (each containing either ``\"text\"`` or
+        ``\"image_b64\"``, plus a 1-based ``\"page\"`` number).
+    max_pages :
+        Maximum number of pages described by this prompt. When ``max_pages``
+        is less than or equal to zero, the prompt is phrased as covering all
+        pages from ``start_page`` onward.
+    start_page :
+        1-based starting page of the logical window being described to the
+        model. This is used only for prompt wording (for example, to say
+        \"pages 11 to 20\") and should match the window used when collecting
+        ``page_payloads``.
+    model :
+        Optional model name override for API abstraction.
+
+    Returns
+    -------
+    Dict[str, Any]
+        The payload dictionary to send to the VLM chat completions
+        API, including system instructions and structured user content.
+    """
     instructions = (
         "You are an assistant that extracts a book's table of contents from PDF content. "
         "For every TOC line, output an object with keys: "
@@ -189,9 +318,20 @@ def _build_payload(
         "If no TOC entries are present, respond with {\"toc\": []}."
     )
 
-    range_label = max_pages if max_pages > 0 else "all"
+    if max_pages <= 0:
+        if start_page <= 1:
+            range_label = "the entire document"
+        else:
+            range_label = f"pages {start_page} and later"
+    else:
+        if start_page <= 1:
+            range_label = f"the first {max_pages} pages"
+        else:
+            end_page = start_page + max_pages - 1
+            range_label = f"pages {start_page} to {end_page}"
+
     intro_text = (
-        f"The following content comes from the first {range_label} pages of a PDF. Each section begins "
+        f"The following content comes from {range_label} of a PDF. Each section begins "
         "with a header like [Page 4]. Analyze the provided text or image for each section, identify "
         "the table-of-contents entries, and extract the title along with any target page number mentioned "
         "in the line. Return JSON exactly as described."
@@ -273,6 +413,18 @@ def _call_chat_completion(
     return body
 
 
+def _is_retryable_error(exc: TOCExtractionError) -> bool:
+    cause = exc.__cause__
+    if isinstance(cause, requests.HTTPError) and cause.response is not None:
+        status = cause.response.status_code
+        if status == 429 or 500 <= status < 600:
+            return True
+    # Treat common transient network failures as retryable as well.
+    if isinstance(cause, (requests.Timeout, requests.ConnectionError)):
+        return True
+    return False
+
+
 def _parse_response_payload(body: Dict[str, Any]) -> List[Dict[str, Any]]:
     choices = body.get("choices")
     if not choices:
@@ -287,9 +439,18 @@ def _parse_response_payload(body: Dict[str, Any]) -> List[Dict[str, Any]]:
     try:
         data = json.loads(json_text)
     except json.JSONDecodeError as exc:
-        raise TOCExtractionError(
-            f"Failed to parse VLM JSON output: {exc}\nRaw: {json_text}"
-        ) from exc
+        # Best-effort repair for slightly invalid JSON coming back from the model.
+        # In practice we sometimes see unquoted or single-quoted keys like
+        #   {page: 11, target_page: 67, content: "Title"}
+        # even though the response is supposed to be strict JSON. When this happens
+        # we attempt to quote the known keys and parse again; if that still fails we
+        # surface the original error.
+        repaired = _repair_toc_json(json_text)
+        if repaired is None:
+            raise TOCExtractionError(
+                f"Failed to parse VLM JSON output: {exc}\nRaw: {json_text}"
+            ) from exc
+        data = repaired
 
     toc: Any
     if isinstance(data, dict):
@@ -297,6 +458,12 @@ def _parse_response_payload(body: Dict[str, Any]) -> List[Dict[str, Any]]:
             toc = data["toc"]
         elif "output" in data and isinstance(data["output"], list):
             toc = data["output"]
+        # Some SiliconFlow responses occasionally return a single TOC-like
+        # object instead of wrapping it in a {\"toc\": [...]} container.
+        # When we see a mapping that looks like one TOC entry, treat it as a
+        # singleton list rather than failing hard.
+        elif "page" in data and "content" in data:
+            toc = [data]
         else:
             raise TOCExtractionError(
                 f"VLM API response missing 'toc' key: {json_text}"
@@ -328,21 +495,154 @@ def _extract_json_block(text: str) -> str:
 
 
 def _find_json_substring(text: str) -> Optional[str]:
+    """Return the first JSON object/array substring found in text.
+
+    This implementation is tolerant of leading/trailing commentary and avoids
+    being confused by brackets that appear inside string literals by delegating
+    to the JSON decoder's raw_decode at different candidate offsets.
+    """
     decoder = json.JSONDecoder()
-    for opener, closer in (("[", "]"), ("{", "}")):
-        start = text.find(opener)
-        end = text.rfind(closer)
-        if start == -1 or end == -1 or end <= start:
+
+    # Fast path: the whole string (after trimming) is valid JSON.
+    stripped = text.strip()
+    try:
+        _, end = decoder.raw_decode(stripped)
+        return stripped[:end]
+    except json.JSONDecodeError:
+        pass
+
+    # General path: search for the first plausible JSON opener and let
+    # raw_decode determine where the JSON payload ends.
+    for idx, ch in enumerate(text):
+        if ch not in "[{":
             continue
-        snippet = text[start : end + 1]
         try:
-            decoder.decode(snippet)
+            _, end = decoder.raw_decode(text[idx:])
         except json.JSONDecodeError:
             continue
-        return snippet
+        return text[idx : idx + end]
+
+    return None
+
+
+def _repair_toc_json(json_text: str) -> Optional[Any]:
+    """Best-effort repair for slightly invalid TOC JSON.
+
+    SiliconFlow is instructed (and configured via response_format) to return
+    strict JSON, but in practice the model may occasionally emit structures
+    with unquoted or single-quoted keys such as:
+
+        {page: 11, target_page: 67, content: "Title"}
+        {'page': 11, 'content': "Title"}
+
+    This helper walks the string outside of double-quoted regions and
+    rewrites the known TOC-related keys (\"toc\", \"page\", \"target_page\",
+    \"content\") into properly double-quoted JSON keys. If parsing still fails
+    we give up and let the caller surface the original error.
+    """
+
+    keys = ("toc", "page", "target_page", "content")
+    result: List[str] = []
+    in_string = False
+    escape = False
+    i = 0
+    length = len(json_text)
+
+    while i < length:
+        ch = json_text[i]
+
+        if in_string:
+            result.append(ch)
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_string = False
+            i += 1
+            continue
+
+        if ch == '"':
+            in_string = True
+            result.append(ch)
+            i += 1
+            continue
+
+        # Handle single-quoted keys like 'page': 1
+        if ch == "'":
+            matched = False
+            for key in keys:
+                key_len = len(key)
+                start = i + 1
+                end = start + key_len
+                if end > length:
+                    continue
+                if json_text[start:end] != key:
+                    continue
+                # Require a closing single quote immediately after the key
+                if end >= length or json_text[end] != "'":
+                    continue
+                # Require a colon after optional whitespace
+                j = end + 1
+                while j < length and json_text[j].isspace():
+                    j += 1
+                if j >= length or json_text[j] != ":":
+                    continue
+
+                # Rewrite 'key' as "key"
+                result.append('"')
+                result.append(key)
+                result.append('"')
+                i = end + 1
+                matched = True
+                break
+
+            if matched:
+                continue
+
+            # Not a recognized key pattern; keep the single quote as-is.
+            result.append(ch)
+            i += 1
+            continue
+
+        # Handle bare keys like page: 1 or target_page: 2
+        if ch.isalpha():
+            matched = False
+            for key in keys:
+                key_len = len(key)
+                end = i + key_len
+                if end > length or json_text[i:end] != key:
+                    continue
+                # Ensure we are not in the middle of a longer identifier
+                before = json_text[i - 1] if i > 0 else ""
+                after = json_text[end] if end < length else ""
+                if before.isalnum() or before == "_" or after.isalnum() or after == "_":
+                    continue
+
+                # Require a colon after optional whitespace
+                j = end
+                while j < length and json_text[j].isspace():
+                    j += 1
+                if j >= length or json_text[j] != ":":
+                    continue
+
+                # Rewrite key as "key"
+                result.append('"')
+                result.append(key)
+                result.append('"')
+                i = end
+                matched = True
+                break
+
+            if matched:
+                continue
+
+        result.append(ch)
+        i += 1
+
+    fixed = "".join(result)
     try:
-        decoder.decode(text)
-        return text
+        return json.loads(fixed)
     except json.JSONDecodeError:
         return None
 
