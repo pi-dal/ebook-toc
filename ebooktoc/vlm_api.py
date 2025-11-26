@@ -109,9 +109,8 @@ class LRUCache(MutableMapping):
 _PAYLOAD_CACHE: LRUCache = LRUCache()
 _PAGE_NUMBER_CACHE: LRUCache = LRUCache()
 
-# Shared HTTP session with retry for VLM calls
-_SESSION: Session | None = None
-_SESSION_LOCK = threading.Lock()
+# Thread-local HTTP sessions with retry for VLM calls
+_SESSION_LOCAL = threading.local()
 
 
 class TOCExtractionError(RuntimeError):
@@ -531,31 +530,30 @@ def _call_chat_completion(
     api_base: str | None = None,
 ) -> dict[str, Any]:
     def _get_session() -> Session:
-        """Return a shared Session configured with retry.
+        """Return a thread-local Session configured with retry.
 
-        The session is initialised lazily to avoid unnecessary work when the
-        module is imported but no network calls are made.
+        Each worker thread gets its own :class:`requests.Session` instance so
+        that parallel VLM requests do not share mutable session state while
+        still benefiting from connection pooling.
         """
 
-        global _SESSION
-        if _SESSION is not None:
-            return _SESSION
-        with _SESSION_LOCK:
-            if _SESSION is not None:
-                return _SESSION
-            session = requests.Session()
-            retry = Retry(
-                total=3,
-                backoff_factor=0.5,
-                status_forcelist=(429, 500, 502, 503, 504),
-                allowed_methods=("GET", "POST"),
-                raise_on_status=False,
-            )
-            adapter = HTTPAdapter(max_retries=retry)
-            session.mount("http://", adapter)
-            session.mount("https://", adapter)
-            _SESSION = session
+        session = getattr(_SESSION_LOCAL, "session", None)
+        if session is not None:
             return session
+
+        session = requests.Session()
+        retry = Retry(
+            total=3,
+            backoff_factor=0.5,
+            status_forcelist=(429, 500, 502, 503, 504),
+            allowed_methods=("GET", "POST"),
+            raise_on_status=False,
+        )
+        adapter = HTTPAdapter(max_retries=retry)
+        session.mount("http://", adapter)
+        session.mount("https://", adapter)
+        _SESSION_LOCAL.session = session
+        return session
 
     base = (api_base or API_BASE_DEFAULT).rstrip("/")
     endpoint = f"{base}/chat/completions"
