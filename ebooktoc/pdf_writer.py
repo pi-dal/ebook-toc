@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable, List, Optional
+from typing import Any, Callable, Iterable
 
 from .utils import ensure_output_path, coerce_positive_int as _util_coerce_positive_int
 
@@ -12,7 +12,7 @@ from .utils import ensure_output_path, coerce_positive_int as _util_coerce_posit
 @dataclass
 class BookmarkResult:
     added: int
-    skipped: List[str]
+    skipped: list[str]
     output_path: Path
 
 
@@ -20,9 +20,26 @@ def write_pdf_toc(
     pdf_path: Path,
     entries: Iterable[dict[str, Any]],
     output_path: Path,
-    page_offset: Optional[int] = None,
+    page_offset: int | None = None,
+    progress_callback: Callable[[int, int], None] | None = None,
 ) -> BookmarkResult:
-    """Write *entries* into the PDF at *pdf_path* and save to *output_path*."""
+    """Write *entries* into the PDF at *pdf_path* and save to *output_path*.
+
+    Parameters
+    ----------
+    pdf_path :
+        Source PDF path.
+    entries :
+        Iterable of TOC entry mappings with ``\"content\"`` and
+        page-related fields.
+    output_path :
+        Destination PDF path.
+    page_offset :
+        Optional offset applied to target pages before writing.
+    progress_callback :
+        Optional callback invoked as ``progress_callback(done, total)``
+        while entries are being prepared. Intended for CLI progress bars.
+    """
 
     try:
         import fitz  # type: ignore[import]
@@ -37,12 +54,16 @@ def write_pdf_toc(
 
     dest_path = ensure_output_path(output_path)
 
+    entries_list = list(entries)
+    total_entries = len(entries_list)
+
     doc = fitz.open(resolved_pdf)  # type: ignore[attr-defined]
     try:
         added = 0
-        skipped: List[str] = []
-        toc_rows: List[List[Any]] = []
-        for entry in entries:
+        skipped: list[str] = []
+        toc_rows: list[list[Any]] = []
+        processed = 0
+        for entry in entries_list:
             if not isinstance(entry, dict):
                 skipped.append("Entry is not a dict")
                 continue
@@ -76,6 +97,14 @@ def write_pdf_toc(
 
             toc_rows.append([1, title, resolved_page])
 
+            processed += 1
+            if progress_callback is not None:
+                try:
+                    progress_callback(processed, total_entries)
+                except Exception:
+                    # Progress reporting is best-effort only.
+                    pass
+
         success = False
         if toc_rows and hasattr(doc, "set_toc"):
             try:
@@ -103,7 +132,7 @@ def write_pdf_toc(
     return BookmarkResult(added=added, skipped=skipped, output_path=dest_path)
 
 
-def _coerce_page(value: Optional[Any]) -> Optional[int]:
+def _coerce_page(value: Any | None) -> int | None:
     # Delegate to shared util to keep semantics consistent
     return _util_coerce_positive_int(value)
 

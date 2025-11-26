@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import threading
 
 import ebooktoc.vlm_api as api
 
@@ -33,3 +34,43 @@ def test_payload_cache_returns_fingerprint_not_page_number(monkeypatch, tmp_path
     p2, f2 = api._get_or_render_page_payload(pdf, 0)
     assert p2 == payload
     assert f2 == fingerprint
+
+
+def test_lru_cache_evicts_least_recently_used():
+    cache = api.LRUCache(maxsize=2)
+    cache["a"] = 1
+    cache["b"] = 2
+    # Access "a" so that "b" becomes the least recently used entry.
+    _ = cache["a"]
+    cache["c"] = 3
+
+    assert "a" in cache
+    assert "c" in cache
+    assert "b" not in cache
+
+
+def test_lru_cache_set_alias_and_basic_get():
+    cache = api.LRUCache(maxsize=2)
+    cache.set("x", 1)
+    assert cache["x"] == 1
+    # get() should mark the key as recently used without raising.
+    assert cache.get("x") == 1
+
+
+def test_lru_cache_thread_safety_under_concurrent_access():
+    cache = api.LRUCache(maxsize=10)
+
+    def worker(offset: int) -> None:
+        for i in range(100):
+            key = f"k{(i + offset) % 20}"
+            cache[key] = i
+            _ = cache.get(key)
+
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(5)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    # Cache should respect its max size and not raise during concurrent access.
+    assert len(cache) <= 10

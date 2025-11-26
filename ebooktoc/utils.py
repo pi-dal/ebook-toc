@@ -54,17 +54,66 @@ def coerce_positive_int(value: Any) -> int | None:
         return None
 
 
-def download_to_temp(url: str, *, prefix: str = "", suffix: str = "") -> Path:
-    """Download URL content to a temporary file and return its path.
+def download_to_temp(
+    url: str,
+    *,
+    prefix: str = "",
+    suffix: str = "",
+    chunk_size: int = 8192,
+    timeout: int = 60,
+) -> Path:
+    """Download URL content to a temporary file using streaming.
 
-    Raises requests.RequestException on network errors.
+    Parameters
+    ----------
+    url :
+        URL to download.
+    prefix, suffix :
+        Temporary file name prefix/suffix.
+    chunk_size :
+        Streaming chunk size in bytes.
+    timeout :
+        Request timeout in seconds.
+
+    Returns
+    -------
+    Path
+        Path to the downloaded temporary file.
+
+    Raises
+    ------
+    requests.RequestException
+        On network errors.
     """
-    resp = requests.get(url, timeout=60)
-    resp.raise_for_status()
-    tmp = tempfile.NamedTemporaryFile(delete=False, prefix=prefix, suffix=suffix)
     try:
-        tmp.write(resp.content)
-        tmp.flush()
+        resp = requests.get(url, timeout=timeout, stream=True)
+    except TypeError:
+        # Backwards-compat for tests or environments where the stubbed
+        # requests.get does not accept ``stream``.
+        resp = requests.get(url, timeout=timeout)
+
+    resp.raise_for_status()
+    tmp = tempfile.NamedTemporaryFile(
+        delete=False,
+        prefix=prefix,
+        suffix=suffix,
+    )
+    try:
+        iterator = getattr(resp, "iter_content", None)
+        if callable(iterator):
+            for chunk in iterator(chunk_size=chunk_size):  # type: ignore[call-arg]
+                if chunk:
+                    tmp.write(chunk)
+        else:
+            # Fallback for simple stubs that expose only ``content``.
+            tmp.write(getattr(resp, "content", b""))
     finally:
         tmp.close()
+        close = getattr(resp, "close", None)
+        if callable(close):
+            try:
+                close()
+            except Exception:
+                # Best-effort cleanup; ignore close() errors.
+                pass
     return Path(tmp.name)

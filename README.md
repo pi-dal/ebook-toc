@@ -56,7 +56,8 @@ pdm run ebook-toc apply input.pdf output/json/input_toc.json --goodnotes-clean -
 - `--max-pages`: upper bound for automatic page expansion when no TOC is detected (default `50`).
 - `--step-pages`: increase in pages per expansion step (default `10`).
 - `--no-auto-expand`: disable automatic expansion and use only the initial `--pages` value.
-- `--batch-size`: number of pages sent to the VLM backend per request (default `3`).
+- `--batch-size`: number of pages sent to the VLM backend per request (default `10`).
+- `--max-workers`: maximum number of concurrent VLM requests (default `3`).
 - `--save-json`: skip the prompt and persist the TOC JSON to disk.
 - `--apply-toc`: skip the prompt and write the TOC into the PDF as bookmarks.
 - `scan --goodnotes-clean`: detect and strip non-dominant-size pages (e.g., GoodNotes inserts) before scanning,
@@ -66,6 +67,34 @@ pdm run ebook-toc apply input.pdf output/json/input_toc.json --goodnotes-clean -
 - `--dry-run`: preview detected TOC entries without creating files.
 - `--filter-contains`: keep only entries whose content includes the given substring (case-insensitive).
 - `--filter-regex`: keep only entries whose content matches the given regular expression (case-insensitive).
+- `--fuzzy-dedup`: fuzzy deduplication threshold in `[0.0, 1.0]` (default `0.85`, set to `0.0` to disable fuzzy matching).
+
+### Performance tuning / recommended settings
+
+For large or scanned PDFs (e.g. 300–800 pages), you can tune a few flags for better throughput and robustness:
+
+- SiliconFlow / generous rate limits:
+  - `--batch-size 10` (default) and `--max-workers 3` (default) work well on a 4‑core CPU.
+  - Keep `--fuzzy-dedup 0.85` (default) to aggressively merge near-duplicate TOC lines from the VLM.
+- Strict or per-request–billed OpenAI-style backends:
+  - Consider `--max-workers 1` or `2` to avoid hitting rate limits.
+  - If each request is expensive, prefer slightly larger `--batch-size` (e.g. `8–12`) over more workers.
+- Very large PDFs (500+ pages):
+  - Use `--pages 0` to allow scanning the entire document in one logical window, or combine `--pages`, `--max-pages`, and `--step-pages` for incremental expansion.
+  - When your PDF was edited heavily in GoodNotes/Notability, add `--goodnotes-clean` so that non‑dominant‑size pages are removed before scanning.
+
+Example for a big, GoodNotes-heavy textbook on SiliconFlow:
+
+```bash
+pdm run ebook-toc scan "book.pdf" \
+  --api-key sk-xxx \
+  --pages 0 \
+  --batch-size 10 \
+  --max-workers 3 \
+  --fuzzy-dedup 0.85 \
+  --goodnotes-clean \
+  --output output/json/book_toc.json
+```
 
 ## Output
 
