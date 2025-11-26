@@ -68,5 +68,9 @@ jobs:
           path: dist/
           if-no-files-found: error
 
+      - name: Remove metadata files before PyPI upload
+        run: |
+          rm -f dist/VERSION.txt dist/TAG.txt
+
       - name: Publish to PyPI (Trusted Publisher)
         uses: pypa/gh-action-pypi-publish@release/v1

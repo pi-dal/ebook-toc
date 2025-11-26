@@ -1,6 +1,6 @@
 [project]
 name = "ebook-toc"
-version = "0.0.1a0"
+version = "0.0.1b0"
 description = "CLI tool to extract PDF table of contents using SiliconFlow Qwen/Qwen3-VL-32B-Instruct"
 authors = [{ name = "Pi" }]
 readme = "README.md"
