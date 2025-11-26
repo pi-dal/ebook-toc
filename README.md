@@ -67,7 +67,7 @@ pdm run ebook-toc apply input.pdf output/json/input_toc.json --goodnotes-clean -
 - `--dry-run`: preview detected TOC entries without creating files.
 - `--filter-contains`: keep only entries whose content includes the given substring (case-insensitive).
 - `--filter-regex`: keep only entries whose content matches the given regular expression (case-insensitive).
- - `--fuzzy-dedup`: fuzzy deduplication threshold in `[0.0, 1.0]` (default `0.85`, set to `0.0` to disable fuzzy matching).
+- `--fuzzy-dedup`: fuzzy deduplication threshold in `[0.0, 1.0]` (default `0.85`, set to `0.0` to disable fuzzy matching).
 
 ### Performance tuning / recommended settings
 

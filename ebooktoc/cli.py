@@ -6,6 +6,7 @@ import argparse
 import re
 import sys
 import time
+import tempfile
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -16,7 +17,6 @@ from .progress import (
     ProgressReporter,
     TimingReport,
     create_progress,
-    format_duration,
     is_interactive,
     print_step_complete,
     timed_progress,
@@ -976,6 +976,7 @@ def _run_apply(args: argparse.Namespace) -> None:
                         f"[cyan]Refined printed-page offset (VLM): {refined_offset:+d} (was {page_offset}).[/]"
                     )
             except TOCExtractionError:
+                # If VLM-based offset refinement fails, keep the previous offset.
                 pass
 
     # If GoodNotes cleaning requested, build clean PDF and resolve via clean->original mapping
@@ -1229,9 +1230,6 @@ def _build_clean_pdf(
 
         if not keep_indices:
             # Nothing to keep; return an empty PDF.
-            import tempfile
-
-
             tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf", prefix="clean-")
             tmp.close()
             clean.save(tmp.name)
@@ -1252,20 +1250,43 @@ def _build_clean_pdf(
 
         clean_idx = 0
 
-        if is_interactive():
-            with create_progress(
-                "Building clean PDF...", total=total or None
-            ) as (progress, task_id):
-                processed = 0
-                for range_start, range_end in ranges:
-                    try:
-                        # Batch insert a contiguous range of pages.
-                        clean.insert_pdf(
-                            src,
-                            from_page=range_start - 1,
-                            to_page=range_end - 1,
+        # Use a progress bar in both interactive and non-interactive modes.
+        # When stdout is not a TTY, create_progress internally disables output.
+        with create_progress(
+            "Building clean PDF...", total=total or None
+        ) as (progress, task_id):
+            processed = 0
+            for range_start, range_end in ranges:
+                try:
+                    # Batch insert a contiguous range of pages.
+                    clean.insert_pdf(
+                        src,
+                        from_page=range_start - 1,
+                        to_page=range_end - 1,
+                    )
+                    for orig_idx in range(range_start, range_end + 1):
+                        clean_idx += 1
+                        clean_to_original[clean_idx] = orig_idx
+                        processed += 1
+                        progress.update(
+                            task_id,
+                            completed=processed,
+                            total=total or processed,
+                            description=(
+                                f"Building clean PDF... {processed}/{total} pages"
+                                if total
+                                else "Building clean PDF..."
+                            ),
                         )
-                        for orig_idx in range(range_start, range_end + 1):
+                except Exception:
+                    # Fallback to per-page insertion when bulk insert fails.
+                    for orig_idx in range(range_start, range_end + 1):
+                        try:
+                            clean.insert_pdf(
+                                src,
+                                from_page=orig_idx - 1,
+                                to_page=orig_idx - 1,
+                            )
                             clean_idx += 1
                             clean_to_original[clean_idx] = orig_idx
                             processed += 1
@@ -1279,57 +1300,10 @@ def _build_clean_pdf(
                                     else "Building clean PDF..."
                                 ),
                             )
-                    except Exception:
-                        # Fallback to per-page insertion when bulk insert fails.
-                        for orig_idx in range(range_start, range_end + 1):
-                            try:
-                                clean.insert_pdf(
-                                    src,
-                                    from_page=orig_idx - 1,
-                                    to_page=orig_idx - 1,
-                                )
-                                clean_idx += 1
-                                clean_to_original[clean_idx] = orig_idx
-                                processed += 1
-                                progress.update(
-                                    task_id,
-                                    completed=processed,
-                                    total=total or processed,
-                                    description=(
-                                        f"Building clean PDF... {processed}/{total} pages"
-                                        if total
-                                        else "Building clean PDF..."
-                                    ),
-                                )
-                            except Exception:
-                                continue
-        else:
-            for range_start, range_end in ranges:
-                try:
-                    clean.insert_pdf(
-                        src,
-                        from_page=range_start - 1,
-                        to_page=range_end - 1,
-                    )
-                    for orig_idx in range(range_start, range_end + 1):
-                        clean_idx += 1
-                        clean_to_original[clean_idx] = orig_idx
-                except Exception:
-                    for orig_idx in range(range_start, range_end + 1):
-                        try:
-                            clean.insert_pdf(
-                                src,
-                                from_page=orig_idx - 1,
-                                to_page=orig_idx - 1,
-                            )
-                            clean_idx += 1
-                            clean_to_original[clean_idx] = orig_idx
                         except Exception:
                             continue
 
         # Save to a temporary file
-        import tempfile
-
         tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf", prefix="clean-")
         tmp.close()
         clean.save(tmp.name)

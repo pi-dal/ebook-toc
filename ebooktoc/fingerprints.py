@@ -115,29 +115,38 @@ def compute_pdf_fingerprints(
     progress_lock = threading.Lock()
     completed = 0
 
-    def _process_page(index: int) -> dict[str, Any]:
+    def _process_chunk(indices: list[int]) -> list[dict[str, Any]]:
         nonlocal completed
+        local_results: list[dict[str, Any]] = []
         with fitz.open(resolved) as doc:  # type: ignore[attr-defined]
-            page = doc.load_page(index)
-            text = page.get_text("text").strip()
-            fp = build_page_fingerprint(page, text)
+            for index in indices:
+                page = doc.load_page(index)
+                text = page.get_text("text").strip()
+                fp = build_page_fingerprint(page, text)
+                local_results.append(fp)
 
-        if progress_callback is not None:
-            with progress_lock:
-                completed += 1
-                try:
-                    progress_callback(completed, end_page)
-                except Exception:
-                    # Progress updates are best-effort only.
-                    pass
+                if progress_callback is not None:
+                    with progress_lock:
+                        completed += 1
+                        try:
+                            progress_callback(completed, end_page)
+                        except Exception:
+                            # Progress updates are best-effort only.
+                            pass
 
-        return fp
+        return local_results
 
     worker_count = max(1, int(max_workers) if max_workers is not None else 1)
+    indices = list(range(end_page))
     if worker_count == 1:
-        fingerprints = [_process_page(i) for i in range(end_page)]
+        fingerprints = _process_chunk(indices)
     else:
+        # Split work into chunks so each worker opens the document only once.
+        # Use a modest chunk size to balance I/O and parallelism.
+        chunk_size = max(1, min(32, end_page // worker_count or 1))
+        chunks = [indices[i : i + chunk_size] for i in range(0, end_page, chunk_size)]
         with concurrent.futures.ThreadPoolExecutor(max_workers=worker_count) as executor:
-            fingerprints = list(executor.map(_process_page, range(end_page)))
+            results = executor.map(_process_chunk, chunks)
+        fingerprints = [fp for chunk in results for fp in chunk]
 
     return fingerprints, page_count

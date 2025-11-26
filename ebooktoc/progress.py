@@ -244,8 +244,16 @@ class ProgressReporter:
                 desc = f"{description} | {extra}"
             update_kwargs["description"] = desc
         elif extra and extra != self._extra_text:
-            # When only extra text changes, keep the existing description.
+            # When only extra text changes, keep the existing description but
+            # update it to reflect the new extra text.
             self._extra_text = extra
+            try:
+                current_task = self.progress.tasks[self.task_id]
+                base_desc = current_task.description
+            except Exception:
+                base_desc = ""
+            desc = f"{base_desc} | {extra}" if base_desc else extra
+            update_kwargs["description"] = desc
 
         self.progress.update(self.task_id, **update_kwargs)
 
@@ -267,4 +275,3 @@ def print_step_complete(message: str, duration: float, details: str = "") -> Non
     console.print(
         f"[green]✓[/] {message} in {format_duration(duration)}{details_str}"
     )
-

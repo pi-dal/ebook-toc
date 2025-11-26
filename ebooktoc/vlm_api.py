@@ -105,10 +105,9 @@ class LRUCache(MutableMapping):
         return f"{self.__class__.__name__}({items})"
 
 
-# Cache maps (pdf_path, index) -> (payload_entry, fingerprint_dict)
+# LRU caches keyed by (pdf_path, index) for rendered payloads and page numbers.
 _PAYLOAD_CACHE: LRUCache = LRUCache()
 _PAGE_NUMBER_CACHE: LRUCache = LRUCache()
-_CACHE_LOCK = threading.Lock()
 
 # Shared HTTP session with retry for VLM calls
 _SESSION: Session | None = None
@@ -301,8 +300,10 @@ def fetch_document_json(
             # expressed in absolute 1-based page numbers rather than
             # window-relative indices.
             if start_page > 1 and raw_map:
-                offset = start_page - 1
-                page_map = {canon: page + offset for canon, page in raw_map.items()}
+                window_offset = start_page - 1
+                page_map = {
+                    canon: page + window_offset for canon, page in raw_map.items()
+                }
             else:
                 page_map = raw_map
 
@@ -924,15 +925,13 @@ def _get_printed_page_number(
     model: str | None = None,
 ) -> int | None:
     cache_key = (str(pdf_path), index)
-    with _CACHE_LOCK:
-        if cache_key in _PAGE_NUMBER_CACHE:
-            cached = _PAGE_NUMBER_CACHE[cache_key]
-            return int(cached) if isinstance(cached, int) else cached
+    if cache_key in _PAGE_NUMBER_CACHE:
+        cached = _PAGE_NUMBER_CACHE[cache_key]
+        return int(cached) if isinstance(cached, int) else cached
 
     image_b64 = _render_page_image_base64(pdf_path, index)
     if image_b64 is None:
-        with _CACHE_LOCK:
-            _PAGE_NUMBER_CACHE[cache_key] = None
+        _PAGE_NUMBER_CACHE[cache_key] = None
         return None
 
     result = _query_page_number(
@@ -942,8 +941,7 @@ def _get_printed_page_number(
         api_base=api_base,
         model=model,
     )
-    with _CACHE_LOCK:
-        _PAGE_NUMBER_CACHE[cache_key] = result
+    _PAGE_NUMBER_CACHE[cache_key] = result
     return result
 
 
@@ -1061,15 +1059,13 @@ def _get_or_render_page_payload(
     pdf_path: Path, index: int
 ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
     cache_key = (str(pdf_path), index)
-    with _CACHE_LOCK:
-        cached = _PAYLOAD_CACHE.get(cache_key)
-        if cached is not None:
-            return cached[0], cached[1]
+    cached = _PAYLOAD_CACHE.get(cache_key)
+    if cached is not None:
+        return cached[0], cached[1]
 
     payload, fingerprint = _render_page_payload(pdf_path, index)
     if payload is not None:
-        with _CACHE_LOCK:
-            _PAYLOAD_CACHE[cache_key] = (payload, fingerprint)
+        _PAYLOAD_CACHE[cache_key] = (payload, fingerprint)
     return payload, fingerprint
 
 
@@ -1105,6 +1101,7 @@ def _render_page_payload(
                     if projected > MAX_IMAGE_DIMENSION:
                         scale = MAX_IMAGE_DIMENSION / max_dim
             except Exception:
+                # Fall back to default scale when geometry inspection fails.
                 pass
             matrix = fitz.Matrix(scale, scale)
             pix = page.get_pixmap(matrix=matrix)
@@ -1116,17 +1113,19 @@ def _render_page_payload(
 
 
 def _purge_cache_for_path(pdf_path: Path) -> None:
-    with _CACHE_LOCK:
-        try:
-            target = str(pdf_path.resolve())
-        except FileNotFoundError:
-            target = str(pdf_path.absolute())
-        keys_to_delete = [key for key in _PAYLOAD_CACHE if key[0] == target]
-        for key in keys_to_delete:
-            del _PAYLOAD_CACHE[key]
-        number_keys = [key for key in _PAGE_NUMBER_CACHE if key[0] == target]
-        for key in number_keys:
-            del _PAGE_NUMBER_CACHE[key]
+    try:
+        target = str(pdf_path.resolve())
+    except FileNotFoundError:
+        target = str(pdf_path.absolute())
+
+    # Take a snapshot of matching keys to delete to avoid mutating during iteration.
+    keys_to_delete = [key for key in _PAYLOAD_CACHE if key[0] == target]
+    for key in keys_to_delete:
+        del _PAYLOAD_CACHE[key]
+
+    number_keys = [key for key in _PAGE_NUMBER_CACHE if key[0] == target]
+    for key in number_keys:
+        del _PAGE_NUMBER_CACHE[key]
 
 
 def _write_temp_json(data: Any) -> Path:

@@ -114,5 +114,6 @@ def download_to_temp(
             try:
                 close()
             except Exception:
+                # Best-effort cleanup; ignore close() errors.
                 pass
     return Path(tmp.name)
