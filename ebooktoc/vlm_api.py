@@ -13,7 +13,7 @@ import json
 import tempfile
 import threading
 import time
-from collections import OrderedDict
+from collections import Counter, OrderedDict
 from collections.abc import MutableMapping
 from pathlib import Path
 from typing import Any, Callable, Iterable
@@ -285,6 +285,7 @@ def fetch_document_json(
                 fingerprints,
                 api_base=api_base,
                 model=effective_model,
+                progress_callback=progress_callback,
             )
         except TOCExtractionError:
             offset = None
@@ -449,9 +450,25 @@ def _build_payload(
         "You are an assistant that extracts a book's table of contents from PDF content. "
         "For every TOC line, output an object with keys: "
         "'page' (integer, the source page number indicated by the excerpt header such as [Page 4]), "
-        "'target_page' (integer or null, the destination page referenced inside the TOC line), and "
+        "'target_page' (integer or null, the destination page number explicitly printed at the END of the TOC line), and "
         "'content' (string, the title text without trailing page numbers or dot leaders). "
-        "If a TOC line omits a destination page number, set 'target_page' to null. "
+        "\n\n"
+        "CRITICAL RULES FOR target_page:\n"
+        "1. ONLY extract page numbers that are EXPLICITLY PRINTED at the END of the TOC line.\n"
+        "2. Page numbers typically appear after dot leaders (like '............   15') or at the right margin.\n"
+        "3. If a TOC line has NO page number printed at the end, you MUST set 'target_page' to null.\n"
+        "4. Do NOT guess, infer, or fabricate page numbers. Only extract what is actually printed.\n"
+        "5. Do NOT confuse section/chapter numbers with page numbers:\n"
+        "   - Section numbers (1.1, 1.2.3, 第1章) appear at the BEGINNING of the line.\n"
+        "   - Page numbers appear at the END of the line, usually right-aligned.\n"
+        "\n"
+        "EXAMPLES:\n"
+        "- Line: '第二版丛书序' (no number at end) → target_page: null\n"
+        "- Line: '前言' (no number at end) → target_page: null\n"
+        "- Line: '第 1 章  电磁现象的基本规律 ...... ...  1' → target_page: 1\n"
+        "- Line: '1.1  场论和张量分析 ............ .... 1' → target_page: 1 (NOT the '1.1' at the start!)\n"
+        "- Line: '1.1.2  张量的定义 ..................  4' → target_page: 4\n"
+        "\n"
         "Respond with a JSON object in the form {\"toc\": [...]} where the array contains only these objects. "
         "Do not include explanations, prose, markdown code fences, or any text outside this JSON object. "
         "If no TOC entries are present, respond with {\"toc\": []}."
@@ -504,7 +521,12 @@ def _build_payload(
         {
             "type": "text",
             "text": (
-                "Example output: {\"toc\": [{\"page\": 4, \"target_page\": 5, \"content\": \"Chapter 1\"}]}. "
+                "REMEMBER: If a TOC entry has no page number at the end, target_page must be null. "
+                "Do NOT fabricate page numbers.\n"
+                "Example output: {\"toc\": ["
+                "{\"page\": 4, \"target_page\": null, \"content\": \"前言\"}, "
+                "{\"page\": 4, \"target_page\": 1, \"content\": \"第1章 导论\"}"
+                "]}. "
                 "Return ONLY the JSON object described above. Do not add extra commentary or formatting."
             ),
         }
@@ -591,7 +613,7 @@ def _parse_response_payload(body: dict[str, Any]) -> list[dict[str, Any]]:
     json_text = _extract_json_block(content)
     try:
         data = json.loads(json_text)
-    except json.JSONDecodeError as exc:
+    except (json.JSONDecodeError, ValueError) as exc:
         # Try a best-effort repair pass before giving up.
         repaired = _repair_toc_json(json_text)
         if repaired is None:
@@ -656,7 +678,7 @@ def _find_json_substring(text: str) -> str | None:
     try:
         _, end = decoder.raw_decode(stripped)
         return stripped[:end]
-    except json.JSONDecodeError:
+    except (json.JSONDecodeError, ValueError):
         pass
 
     # General path: search for the first plausible JSON opener and let
@@ -666,7 +688,7 @@ def _find_json_substring(text: str) -> str | None:
             continue
         try:
             _, end = decoder.raw_decode(text[idx:])
-        except json.JSONDecodeError:
+        except (json.JSONDecodeError, ValueError):
             continue
         return text[idx : idx + end]
 
@@ -791,7 +813,7 @@ def _repair_toc_json(json_text: str) -> Any | None:
     fixed = "".join(result)
     try:
         return json.loads(fixed)
-    except json.JSONDecodeError:
+    except (json.JSONDecodeError, ValueError):
         return None
 
 
@@ -822,12 +844,95 @@ def _infer_page_offset(
     api_key: str,
     timeout: int,
     fingerprints: list[dict[str, Any]] | None = None,
-    max_samples: int = 3,
+    max_samples: int = 5,
     api_base: str | None = None,
     model: str | None = None,
+    progress_callback: Callable[[int, int, str], None] | None = None,
 ) -> int | None:
+    """Infer the offset between printed page numbers and PDF page indices.
+
+    The offset satisfies: ``pdf_page_1based = printed_page + offset``. For
+    example, if printed page 1 is on PDF page 11, then ``offset == 10``.
+
+    This implementation uses a heuristic search plus verification strategy:
+
+    1. Select reliable anchor entries from the TOC (prefer larger
+       ``target_page`` values).
+    2. For each anchor, search a candidate offset range ``[0, 50]``.
+    3. Verify the best-found offset using other TOC entries.
+    4. Fall back to a sampling-based method if the heuristic search fails.
+
+    Parameters
+    ----------
+    pdf_path :
+        Path to the PDF file.
+    entries :
+        List of TOC entry dictionaries with ``\"target_page\"`` and/or
+        ``\"page\"`` fields.
+    api_key :
+        VLM API key for page-number recognition.
+    timeout :
+        Request timeout in seconds.
+    fingerprints :
+        Optional page fingerprints for compatibility with callers. Currently
+        unused by the heuristic search but may be leveraged by future
+        refinements.
+    max_samples :
+        Maximum number of samples to use when falling back to the sampling
+        method.
+    api_base :
+        Optional API base URL override.
+    model :
+        Optional model name override.
+
+    Returns
+    -------
+    int | None
+        The inferred offset, or ``None`` if inference fails.
+    """
     if not entries:
         return None
+
+    # When multiple page-numbering segments are present (for example, preface
+    # and body both starting from printed page 1), try to infer a per-segment
+    # offset first and return the dominant body's offset for backward
+    # compatibility.
+    try:
+        from .toc_parser import (
+            detect_page_segments,
+            classify_entries,
+            select_anchor_entries,
+            locate_entry_by_text_search,
+        )
+    except Exception:  # pragma: no cover - defensive import
+        detect_page_segments = None  # type: ignore[assignment]
+        classify_entries = None  # type: ignore[assignment]
+        select_anchor_entries = None  # type: ignore[assignment]
+        locate_entry_by_text_search = None  # type: ignore[assignment]
+
+    if detect_page_segments is not None:
+        try:
+            segments = detect_page_segments(entries)
+        except Exception:
+            segments = []
+        else:
+            if len(segments) > 1:
+                _infer_offsets_for_segments(
+                    pdf_path,
+                    segments,
+                    api_key,
+                    timeout,
+                    api_base=api_base,
+                    model=model,
+                )
+                for seg in segments:
+                    if getattr(seg, "segment_type", None) == "body" and getattr(
+                        seg, "offset", None
+                    ) is not None:
+                        return int(seg.offset)  # type: ignore[return-value]
+                for seg in segments:
+                    if getattr(seg, "offset", None) is not None:
+                        return int(seg.offset)  # type: ignore[return-value]
 
     try:
         import fitz  # type: ignore[import]
@@ -838,80 +943,1029 @@ def _infer_page_offset(
     with fitz.open(resolved) as doc:  # type: ignore[attr-defined]
         page_count = doc.page_count
 
-    # Build candidate (canonical_index, pdf_index0) pairs for sampling
-    cano_pdf_pairs: list[tuple[int, int]] = []
+    if page_count == 0:
+        return None
 
-    # 1) Prefer sampling at canonical 1/3, 1/2, 2/3 positions on dominant-dimension pages
-    dominant_dims: tuple[int, int] | None = None
-    canonical_map: dict[int, int] = {}
-    if fingerprints:
-        dominant_dims = dominant_dimensions(fingerprints)
-        if dominant_dims:
-            canonical_map = build_canonical_map_for_dims(fingerprints, dominant_dims)
-            total_canonical = len(canonical_map)
-            for frac in (1 / 3, 1 / 2, 2 / 3):
-                if total_canonical == 0:
-                    break
-                ci = max(1, min(total_canonical, int(round(total_canonical * frac))))
-                pdf_page = canonical_map.get(ci)
-                if isinstance(pdf_page, int):
-                    idx0 = max(0, pdf_page - 1)
-                    pair = (ci, idx0)
-                    if pair not in cano_pdf_pairs:
-                        cano_pdf_pairs.append(pair)
-                if len(cano_pdf_pairs) >= max_samples:
-                    break
+    # Prefer multi-anchor positioning when classification helpers are
+    # available; fall back to legacy heuristics otherwise.
+    if classify_entries is not None and select_anchor_entries is not None and locate_entry_by_text_search is not None:
+        try:
+            _unnumbered, _suspicious, normal = classify_entries(entries)
+        except Exception:
+            normal = list(range(len(entries)))
 
-    # 2) Fallback to TOC-derived anchors if needed
-    if len(cano_pdf_pairs) < max_samples:
-        for entry in entries:
-            target = _util_coerce_positive_int(entry.get("target_page"))
-            if target is None:
-                target = _util_coerce_positive_int(entry.get("page"))
-            if target is None:
-                continue
-            index0 = max(0, target - 1)
-            pair = (target, index0)  # assume canonical ~ printed when baseline not present
-            if pair not in cano_pdf_pairs:
-                cano_pdf_pairs.append(pair)
-            if len(cano_pdf_pairs) >= max_samples:
-                break
+        anchors = select_anchor_entries(entries, normal, max_anchors=max_samples)
+        if anchors:
+            total_anchors = len(anchors)
+            for idx, anchor in enumerate(anchors):
+                # Try zero-cost text search first.
+                pdf_page = locate_entry_by_text_search(
+                    resolved,
+                    anchor.content,
+                    search_start=1,
+                    search_end=min(page_count, anchor.printed_page + 100),
+                )
+                if pdf_page is not None:
+                    anchor.pdf_page = pdf_page
+                    anchor.located_by = "text"
+                    anchor.offset = pdf_page - anchor.printed_page
+                    continue
 
-    # 3) And as last resort add mid / end pages
-    if len(cano_pdf_pairs) < max_samples and page_count > 1:
-        for idx in (page_count // 2, page_count - 1):
-            if idx >= 0:
-                pair = (idx + 1, idx)  # approximate canonical=index+1
-                if pair not in cano_pdf_pairs:
-                    cano_pdf_pairs.append(pair)
-            if len(cano_pdf_pairs) >= max_samples:
-                break
+                # Fallback to VLM-based printed-page probing when available.
+                pdf_page = locate_anchor_by_vlm(
+                    resolved,
+                    anchor.content,
+                    anchor.printed_page,
+                    api_key,
+                    timeout,
+                    page_count,
+                    api_base=api_base,
+                    model=model,
+                )
+                if pdf_page is not None:
+                    anchor.pdf_page = pdf_page
+                    anchor.located_by = "vlm"
+                    anchor.offset = pdf_page - anchor.printed_page
 
-    offsets: list[int] = []
-    for canonical_idx, index0 in cano_pdf_pairs:
-        if index0 < 0 or index0 >= page_count:
-            continue
-        page_number = _get_printed_page_number(
+                if progress_callback is not None and total_anchors:
+                    try:
+                        progress_callback(
+                            idx + 1,
+                            total_anchors,
+                            f"Inferring printed-page offset (VLM)... anchors {idx + 1}/{total_anchors}",
+                        )
+                    except Exception:
+                        pass
+
+            valid_anchors = [(a, a.offset) for a in anchors if a.offset is not None]
+            if valid_anchors:
+                if len(valid_anchors) == 1:
+                    # Only one anchor succeeded; accept its offset but keep
+                    # legacy fallbacks available if it later proves wrong.
+                    return int(valid_anchors[0][1])  # type: ignore[arg-type]
+
+                offsets = [int(o) for _, o in valid_anchors]  # type: ignore[arg-type]
+                offset_range = max(offsets) - min(offsets)
+
+                offsets.sort()
+                if offset_range <= 5:
+                    # Very consistent offsets – pick the median.
+                    return offsets[len(offsets) // 2]
+                if offset_range <= 20:
+                    # Some variation but still plausible – median is robust.
+                    return offsets[len(offsets) // 2]
+
+                # Large disagreement between anchors; prefer the most common
+                # offset rather than trusting a single outlier.
+                counts = Counter(offsets)
+                most_common, _ = counts.most_common(1)[0]
+                return most_common
+
+    # Legacy heuristic path: single-anchor style probing with verification and
+    # sampling fallback.
+    offset = _heuristic_offset_search(
+        resolved,
+        entries,
+        api_key,
+        timeout,
+        page_count,
+        api_base=api_base,
+        model=model,
+    )
+
+    if offset is not None:
+        if _verify_offset(
             resolved,
-            index0,
+            entries,
+            offset,
+            api_key,
+            timeout,
+            page_count,
+            max_verify=3,
+            api_base=api_base,
+            model=model,
+        ):
+            return offset
+
+    return _fallback_offset_sampling(
+        resolved,
+        entries,
+        api_key,
+        timeout,
+        page_count,
+        fingerprints,
+        max_samples,
+        api_base=api_base,
+        model=model,
+    )
+
+
+def _infer_offsets_for_segments(
+    pdf_path: Path,
+    segments: list[Any],
+    api_key: str,
+    timeout: int,
+    api_base: str | None = None,
+    model: str | None = None,
+) -> None:
+    """Infer offsets for each PageSegment in-place using heuristics.
+
+    The strategy mirrors :func:`_infer_page_offset` but runs independently
+    for each segment so that books with multiple page-numbering systems
+    (for example, preface and body) receive distinct offsets.
+
+    Parameters
+    ----------
+    pdf_path :
+        Path to the PDF file.
+    segments :
+        List of :class:`ebooktoc.toc_parser.PageSegment` instances.
+    api_key :
+        VLM API key.
+    timeout :
+        Request timeout in seconds.
+    api_base :
+        Optional API base URL override.
+    model :
+        Optional model name override.
+    """
+    if not segments:
+        return
+
+    try:
+        import fitz  # type: ignore[import]
+    except ImportError:
+        return
+
+    resolved = pdf_path.resolve()
+    with fitz.open(resolved) as doc:  # type: ignore[attr-defined]
+        page_count = doc.page_count
+
+    if page_count == 0:
+        return
+
+    for segment in segments:
+        segment_entries = getattr(segment, "entries", None) or []
+        if not segment_entries:
+            continue
+
+        # Use a conservative offset search range for all segments to keep API
+        # calls bounded. Most books have front matter + body offsets well
+        # below 80 pages.
+        offset = _heuristic_offset_search(
+            resolved,
+            segment_entries,
+            api_key,
+            timeout,
+            page_count,
+            api_base=api_base,
+            model=model,
+            offset_range=(0, 80),
+            step=5,
+        )
+        if offset is None:
+            continue
+
+        if _verify_offset(
+            resolved,
+            segment_entries,
+            offset,
+            api_key,
+            timeout,
+            page_count,
+            max_verify=3,
+            api_base=api_base,
+            model=model,
+        ):
+            try:
+                # PageSegment has an ``offset`` attribute; fall back silently
+                # when it does not.
+                segment.offset = int(offset)  # type: ignore[attr-defined]
+            except Exception:
+                continue
+
+
+def _heuristic_offset_search(
+    pdf_path: Path,
+    entries: list[dict[str, Any]],
+    api_key: str,
+    timeout: int,
+    page_count: int,
+    api_base: str | None = None,
+    model: str | None = None,
+    offset_range: tuple[int, int] = (0, 50),
+    step: int = 5,
+) -> int | None:
+    """Search for a plausible offset using TOC anchors.
+
+    This function selects TOC entries with relatively large printed page
+    numbers (for example, ``target_page > 30``) under the assumption that
+    later chapters are more likely to have visible printed page numbers. For
+    each such anchor, it searches a candidate offset range and compares the
+    printed page number detected by the VLM with the TOC value.
+
+    Parameters
+    ----------
+    pdf_path :
+        Path to the PDF file.
+    entries :
+        List of TOC entry dictionaries.
+    api_key :
+        VLM API key.
+    timeout :
+        Request timeout in seconds.
+    page_count :
+        Total number of pages in the PDF.
+    api_base :
+        Optional API base URL override.
+    model :
+        Optional model name override.
+    offset_range :
+        Inclusive ``(min_offset, max_offset)`` range to search.
+    step :
+        Step size for the coarse search before fine-tuning.
+
+    Returns
+    -------
+    int | None
+        The first offset that yields a consistent match for an anchor, or
+        ``None`` if no candidate is found.
+    """
+    # Collect reliable anchors: entries with target_page > 30.
+    anchors: list[tuple[int, str]] = []
+    for entry in entries:
+        target = _coerce_positive_int(entry.get("target_page"))
+        if target is None:
+            target = _coerce_positive_int(entry.get("page"))
+        if target is not None and target > 30:
+            title = (entry.get("content") or "")[:50]
+            anchors.append((target, title))
+
+    # Sort by target_page descending (larger pages are more reliable).
+    anchors.sort(key=lambda x: x[0], reverse=True)
+
+    # Also add some medium-range anchors for diversity.
+    medium_anchors = [(t, title) for t, title in anchors if 50 <= t <= 150]
+    anchors = anchors[:3] + medium_anchors[:2]
+
+    if not anchors:
+        # No reliable anchors found; fall back to smaller pages (>10).
+        for entry in entries:
+            target = _coerce_positive_int(entry.get("target_page"))
+            if target is not None and target > 10:
+                anchors.append((target, (entry.get("content") or "")[:50]))
+                if len(anchors) >= 3:
+                    break
+
+    if not anchors:
+        return None
+
+    min_off, max_off = offset_range
+
+    for target_printed, _title in anchors[:3]:
+        # Coarse search with a configurable step.
+        for candidate_offset in range(min_off, max_off + 1, step):
+            pdf_page_1based = target_printed + candidate_offset
+            pdf_idx = pdf_page_1based - 1
+
+            if pdf_idx < 0 or pdf_idx >= page_count:
+                continue
+
+            printed = _get_printed_page_number(
+                pdf_path,
+                pdf_idx,
+                api_key,
+                timeout,
+                api_base=api_base,
+                model=model,
+            )
+
+            if printed is None:
+                continue
+
+            if printed == target_printed:
+                # Found an exact match.
+                return candidate_offset
+
+            # If close, perform a fine-grained search around this offset.
+            if abs(printed - target_printed) <= step:
+                fine_offset = _fine_search_offset(
+                    pdf_path,
+                    target_printed,
+                    candidate_offset,
+                    api_key,
+                    timeout,
+                    page_count,
+                    api_base=api_base,
+                    model=model,
+                    search_radius=step,
+                )
+                if fine_offset is not None:
+                    return fine_offset
+
+    return None
+
+
+def _fine_search_offset(
+    pdf_path: Path,
+    target_printed: int,
+    center_offset: int,
+    api_key: str,
+    timeout: int,
+    page_count: int,
+    api_base: str | None = None,
+    model: str | None = None,
+    search_radius: int = 5,
+) -> int | None:
+    """Search offsets in a small window around ``center_offset``.
+
+    Parameters
+    ----------
+    pdf_path :
+        Path to the PDF file.
+    target_printed :
+        Printed page number from the TOC for the anchor entry.
+    center_offset :
+        Offset around which to search.
+    api_key :
+        VLM API key.
+    timeout :
+        Request timeout in seconds.
+    page_count :
+        Total number of pages in the PDF.
+    api_base :
+        Optional API base URL override.
+    model :
+        Optional model name override.
+    search_radius :
+        Symmetric radius (in offset units) around ``center_offset``.
+
+    Returns
+    -------
+    int | None
+        The first offset in the window that yields an exact match, or
+        ``None`` if no candidate matches.
+    """
+    for delta in range(-search_radius, search_radius + 1):
+        if delta == 0:
+            # The centre offset will already have been checked by the caller.
+            continue
+
+        candidate_offset = center_offset + delta
+        pdf_idx = target_printed + candidate_offset - 1
+
+        if pdf_idx < 0 or pdf_idx >= page_count:
+            continue
+
+        printed = _get_printed_page_number(
+            pdf_path,
+            pdf_idx,
             api_key,
             timeout,
             api_base=api_base,
             model=model,
         )
-        if page_number is None:
+
+        if printed == target_printed:
+            return candidate_offset
+
+    return None
+
+
+def _verify_offset(
+    pdf_path: Path,
+    entries: list[dict[str, Any]],
+    offset: int,
+    api_key: str,
+    timeout: int,
+    page_count: int,
+    max_verify: int = 3,
+    api_base: str | None = None,
+    model: str | None = None,
+    tolerance: int = 1,
+) -> bool:
+    """Verify a candidate offset by sampling TOC entries.
+
+    Parameters
+    ----------
+    pdf_path :
+        Path to the PDF file.
+    entries :
+        TOC entries to use for verification.
+    offset :
+        Candidate offset to verify.
+    api_key :
+        VLM API key.
+    timeout :
+        Request timeout in seconds.
+    page_count :
+        Total number of pages in the PDF.
+    max_verify :
+        Maximum number of entries to verify.
+    api_base :
+        Optional API base URL override.
+    model :
+        Optional model name override.
+    tolerance :
+        Allowed absolute difference between detected and expected printed
+        page numbers for a verification to be considered a success.
+
+    Returns
+    -------
+    bool
+        ``True`` if the majority of sampled entries agree with the offset
+        within the specified tolerance, otherwise ``False``.
+    """
+    verify_targets: list[int] = []
+    for entry in entries:
+        target = _coerce_positive_int(entry.get("target_page"))
+        if target is None:
+            target = _coerce_positive_int(entry.get("page"))
+        if target is not None and 20 < target < 200:
+            verify_targets.append(target)
+
+    # Deduplicate to avoid querying the same page multiple times.
+    verify_targets = list(set(verify_targets))
+    if len(verify_targets) > max_verify and max_verify > 0:
+        # Sample roughly evenly spaced entries from the list.
+        step = max(1, len(verify_targets) // max_verify)
+        verify_targets = verify_targets[::step][:max_verify]
+
+    if not verify_targets:
+        # No verification candidates; treat the offset as acceptable.
+        return True
+
+    success_count = 0
+    total_checked = 0
+
+    for target_printed in verify_targets:
+        pdf_idx = target_printed + offset - 1
+        if pdf_idx < 0 or pdf_idx >= page_count:
             continue
-        # offset aligns printed page to canonical index: canonical = printed + offset
-        offsets.append(canonical_idx - page_number)
-        if len(offsets) >= max_samples:
+
+        printed = _get_printed_page_number(
+            pdf_path,
+            pdf_idx,
+            api_key,
+            timeout,
+            api_base=api_base,
+            model=model,
+        )
+
+        if printed is None:
+            continue
+
+        total_checked += 1
+        if abs(printed - target_printed) <= tolerance:
+            success_count += 1
+
+    if total_checked == 0:
+        # If we could not read any printed numbers, assume success so the
+        # caller can decide how to proceed.
+        return True
+
+    # Require a simple majority of successful checks.
+    return success_count >= (total_checked + 1) // 2
+
+
+def _fallback_offset_sampling(
+    pdf_path: Path,
+    entries: list[dict[str, Any]],
+    api_key: str,
+    timeout: int,
+    page_count: int,
+    fingerprints: list[dict[str, Any]] | None,
+    max_samples: int,
+    api_base: str | None = None,
+    model: str | None = None,
+) -> int | None:
+    """Fallback offset estimation using sampled printed page numbers.
+
+    This method samples a small number of pages from the latter half of the
+    document (where printed page numbers are more likely to be stable) and
+    derives an offset from the relationship between printed and PDF indices.
+
+    Parameters
+    ----------
+    pdf_path :
+        Path to the PDF file.
+    entries :
+        TOC entries (currently unused but accepted for future extensions).
+    api_key :
+        VLM API key.
+    timeout :
+        Request timeout in seconds.
+    page_count :
+        Total number of pages in the PDF.
+    fingerprints :
+        Optional page fingerprints (currently unused).
+    max_samples :
+        Maximum number of samples to use.
+    api_base :
+        Optional API base URL override.
+    model :
+        Optional model name override.
+
+    Returns
+    -------
+    int | None
+        Median offset computed from the sampled pages, or ``None`` if no
+        reliable samples are available.
+    """
+    if page_count <= 0 or max_samples <= 0:
+        return None
+
+    sample_indices: list[int] = []
+
+    # Prefer pages at regular intervals in the latter portion of the PDF.
+    for frac in (0.4, 0.5, 0.6, 0.7, 0.8):
+        idx = int(page_count * frac)
+        if idx >= page_count:
+            idx = page_count - 1
+        if idx < 0:
+            continue
+        if idx not in sample_indices:
+            sample_indices.append(idx)
+        if len(sample_indices) >= max_samples:
             break
+
+    if not sample_indices:
+        return None
+
+    offsets: list[int] = []
+
+    for pdf_idx in sample_indices:
+        if pdf_idx < 0 or pdf_idx >= page_count:
+            continue
+
+        printed = _get_printed_page_number(
+            pdf_path,
+            pdf_idx,
+            api_key,
+            timeout,
+            api_base=api_base,
+            model=model,
+        )
+
+        if printed is None or printed <= 0:
+            continue
+
+        # offset = pdf_page_1based - printed_page
+        pdf_page_1based = pdf_idx + 1
+        offset = pdf_page_1based - printed
+        offsets.append(offset)
 
     if not offsets:
         return None
 
     offsets.sort()
-    median = offsets[len(offsets) // 2]
-    return median
+    return offsets[len(offsets) // 2]
+
+
+def _get_printed_page_numbers_concurrent(
+    pdf_path: Path,
+    page_indices: list[int],
+    api_key: str,
+    timeout: int,
+    api_base: str | None = None,
+    model: str | None = None,
+    max_workers: int = 4,
+) -> dict[int, int | None]:
+    """Return printed page numbers for multiple PDF pages concurrently.
+
+    Parameters
+    ----------
+    pdf_path :
+        Path to the PDF file.
+    page_indices :
+        0-based PDF page indices to query.
+    api_key :
+        VLM API key.
+    timeout :
+        Request timeout per call in seconds.
+    api_base :
+        Optional API base URL override.
+    model :
+        Optional model name override.
+    max_workers :
+        Maximum number of concurrent worker threads.
+
+    Returns
+    -------
+    dict[int, int | None]
+        Mapping from page index to detected printed page number, or ``None``
+        when the model could not determine a number.
+    """
+    results: dict[int, int | None] = {}
+    if not page_indices:
+        return results
+
+    def _query(idx: int) -> tuple[int, int | None]:
+        printed = _get_printed_page_number(
+            pdf_path,
+            idx,
+            api_key,
+            timeout,
+            api_base=api_base,
+            model=model,
+        )
+        return idx, printed
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = [executor.submit(_query, idx) for idx in page_indices]
+        for future in concurrent.futures.as_completed(futures):
+            try:
+                idx, printed = future.result()
+            except Exception:
+                continue
+            results[idx] = printed
+
+    return results
+
+
+def locate_anchor_by_vlm(
+    pdf_path: Path,
+    anchor_content: str,
+    anchor_printed_page: int,
+    api_key: str,
+    timeout: int,
+    page_count: int,
+    api_base: str | None = None,
+    model: str | None = None,
+) -> int | None:
+    """Locate an anchor entry's PDF page using VLM.
+
+    Strategy
+    --------
+    * For small printed pages (1–10), search the early portion of the PDF
+      with a fine step so that we do not skip the true location.
+    * For larger printed pages, search around the estimated region based
+      on typical offsets.
+    * Perform a coarse scan first, then refine around the closest match.
+    """
+    if page_count <= 0:
+        return None
+
+    # Phase 1: coarse sampling at a handful of strategic positions to
+    # estimate the offset between printed and PDF pages.
+    sample_indices = _get_sample_positions(page_count, anchor_printed_page)
+    if not sample_indices:
+        return None
+
+    sample_results = _get_printed_page_numbers_concurrent(
+        pdf_path,
+        sample_indices,
+        api_key,
+        timeout,
+        api_base=api_base,
+        model=model,
+        max_workers=4,
+    )
+
+    # Exact matches in the coarse samples can be used immediately.
+    for idx0, printed in sample_results.items():
+        if printed == anchor_printed_page:
+            return idx0 + 1
+
+    estimated_offset = _estimate_offset_from_samples(
+        sample_results,
+        anchor_printed_page,
+    )
+    if estimated_offset is None:
+        return None
+
+    # Phase 2: fine search around the estimated location in a narrow window.
+    estimated_pdf_page = anchor_printed_page + estimated_offset
+    fine_indices: list[int] = []
+    for delta in range(-5, 6):
+        candidate = estimated_pdf_page + delta - 1  # 0-based index
+        if candidate < 0 or candidate >= page_count:
+            continue
+        if candidate in sample_results:
+            continue
+        fine_indices.append(candidate)
+
+    if not fine_indices:
+        return None
+
+    fine_results = _get_printed_page_numbers_concurrent(
+        pdf_path,
+        fine_indices,
+        api_key,
+        timeout,
+        api_base=api_base,
+        model=model,
+        max_workers=4,
+    )
+    for idx0, printed in fine_results.items():
+        if printed == anchor_printed_page:
+            return idx0 + 1
+
+    return None
+
+
+def _get_sample_positions(page_count: int, anchor_printed_page: int) -> list[int]:
+    """Return 0-based page indices to probe for coarse offset sampling."""
+    positions: list[int] = []
+    if page_count <= 0:
+        return positions
+
+    if anchor_printed_page <= 10:
+        # When printed page numbers are very small, scatter samples in the
+        # front of the document.
+        candidates = [5, 10, 15, 20, 30, 40, 50]
+    else:
+        base = anchor_printed_page
+        candidates = [base + 5, base + 15, base + 25, base + 40]
+
+    for pos in candidates:
+        idx = pos - 1
+        if 0 <= idx < page_count and idx not in positions:
+            positions.append(idx)
+
+    return positions[:5]
+
+
+def _estimate_offset_from_samples(
+    sample_results: dict[int, int | None],
+    target_printed: int,
+) -> int | None:
+    """Estimate a PDF offset from coarse printed-page samples."""
+    valid: list[tuple[int, int]] = [
+        (idx0, printed)
+        for idx0, printed in sample_results.items()
+        if printed is not None and printed > 0
+    ]
+    if not valid:
+        return None
+
+    # Pick the sampled page whose printed page is closest to the target.
+    closest_idx, closest_printed = min(
+        valid,
+        key=lambda item: abs(item[1] - target_printed),
+    )
+    # offset = pdf_page_1based - printed_page
+    estimated_offset = (closest_idx + 1) - closest_printed
+    return estimated_offset
+
+
+def _fine_search_for_printed_page(
+    pdf_path: Path,
+    target_printed: int,
+    reference_pdf_page: int,
+    reference_printed: int,
+    api_key: str,
+    timeout: int,
+    page_count: int,
+    api_base: str | None = None,
+    model: str | None = None,
+) -> int | None:
+    """Search nearby pages for an exact printed page number match."""
+    estimated_offset = reference_pdf_page - reference_printed
+    estimated_pdf_page = target_printed + estimated_offset
+
+    start = max(1, estimated_pdf_page - 5)
+    end = min(page_count, estimated_pdf_page + 5)
+
+    for test_page in range(start, end + 1):
+        if test_page == reference_pdf_page:
+            continue
+        printed = _get_printed_page_number(
+            pdf_path,
+            test_page - 1,
+            api_key,
+            timeout,
+            api_base=api_base,
+            model=model,
+        )
+        if printed == target_printed:
+            return test_page
+
+    return None
+
+
+def locate_heading_by_vlm(
+    pdf_path: Path,
+    heading_text: str,
+    search_start: int,
+    search_end: int,
+    api_key: str,
+    timeout: int,
+    api_base: str | None = None,
+    model: str | None = None,
+) -> int | None:
+    """Locate a heading/title within a PDF page range using the VLM.
+
+    This helper is used for entries that do not have reliable printed
+    page numbers (for example, unnumbered preface items). It scans a
+    small range of pages and asks the VLM whether the heading appears on
+    each page, stopping at the first positive hit.
+    """
+    for page_num in range(max(1, search_start), max(search_start, search_end) + 1):
+        if _check_page_for_heading(
+            pdf_path,
+            page_num,
+            heading_text,
+            api_key,
+            timeout,
+            api_base=api_base,
+            model=model,
+        ):
+            return page_num
+    return None
+
+
+def _check_page_for_heading(
+    pdf_path: Path,
+    page_num: int,
+    heading_text: str,
+    api_key: str,
+    timeout: int,
+    api_base: str | None = None,
+    model: str | None = None,
+) -> bool:
+    """Return ``True`` if VLM judges that *heading_text* appears on *page_num*."""
+    image_b64 = _render_page_image_base64(pdf_path, page_num - 1)
+    if image_b64 is None:
+        return False
+
+    instructions = (
+        "You are given a page from a book. Determine whether the page contains "
+        f"the heading or title: \"{heading_text}\".\n"
+        "Headings may appear at the top of the page, as chapter titles, or as "
+        "section headings. Respond with a JSON object {\"found\": true} if the "
+        "heading is present, or {\"found\": false} otherwise. Only respond true "
+        "for exact or very close matches (minor punctuation or spacing "
+        "differences are acceptable)."
+    )
+
+    user_content = [
+        {
+            "type": "text",
+            "text": f"Does this page contain the heading \"{heading_text}\"?",
+        },
+        {
+            "type": "image_url",
+            "image_url": {"url": f"data:image/jpeg;base64,{image_b64}"},
+        },
+    ]
+
+    payload = {
+        "model": model or MODEL_NAME,
+        "temperature": 0,
+        "messages": [
+            {"role": "system", "content": instructions},
+            {"role": "user", "content": user_content},
+        ],
+        "response_format": {"type": "json_object"},
+    }
+
+    try:
+        body = _call_chat_completion(
+            api_key,
+            payload,
+            request_timeout=timeout,
+            api_base=api_base,
+        )
+    except TOCExtractionError:
+        return False
+
+    choices = body.get("choices") or []
+    if not choices:
+        return False
+
+    message = choices[0].get("message", {})
+    content = message.get("content")
+    if not isinstance(content, str):
+        return False
+
+    json_text = _extract_json_block(content)
+    try:
+        data = json.loads(json_text)
+    except (json.JSONDecodeError, ValueError):
+        return False
+
+    found = data.get("found")
+    try:
+        return bool(found)
+    except Exception:
+        return False
+
+
+def resolve_unnumbered_entries(
+    pdf_path: Path,
+    entries: list[dict[str, Any]],
+    unnumbered_indices: list[int],
+    suspicious_indices: list[int],
+    first_body_pdf_page: int | None,
+    api_key: str | None,
+    timeout: int,
+    api_base: str | None = None,
+    model: str | None = None,
+) -> dict[int, int | None]:
+    """Resolve PDF pages for unnumbered and suspicious TOC entries.
+
+    The resolver prefers free text search and only falls back to VLM
+    when necessary. It is intended for front-matter items such as
+    prefaces and forewords that lack printed page numbers.
+
+    Parameters
+    ----------
+    pdf_path :
+        Path to the PDF file.
+    entries :
+        Full list of TOC entries.
+    unnumbered_indices :
+        Indices of entries whose ``target_page`` is ``None``.
+    suspicious_indices :
+        Indices of entries whose ``target_page`` looks fabricated.
+    first_body_pdf_page :
+        Approximate PDF page where the main body starts. When provided,
+        search for unnumbered entries will be restricted to pages before
+        this page; otherwise a conservative front range is used.
+    api_key :
+        Optional VLM API key. When omitted, only text search is used.
+    timeout :
+        Request timeout in seconds for VLM calls.
+    api_base :
+        Optional API base URL override.
+    model :
+        Optional model name override.
+
+    Returns
+    -------
+    dict[int, int | None]
+        Mapping from entry index to resolved 1-based PDF page number.
+        Values may be ``None`` when resolution fails.
+    """
+    indices: list[int] = list(dict.fromkeys(unnumbered_indices + suspicious_indices))
+    if not indices:
+        return {}
+
+    try:
+        from .toc_parser import locate_entry_by_text_search
+    except Exception:  # pragma: no cover - defensive import
+        locate_entry_by_text_search = None  # type: ignore[assignment]
+
+    try:
+        import fitz  # type: ignore[import]
+    except ImportError:
+        return {}
+
+    resolved = pdf_path.resolve()
+    try:
+        with fitz.open(resolved) as doc:  # type: ignore[attr-defined]
+            page_count = doc.page_count
+    except Exception:
+        return {}
+
+    if page_count <= 0:
+        return {}
+
+    if first_body_pdf_page and first_body_pdf_page > 1:
+        search_end = max(1, min(page_count, first_body_pdf_page - 1))
+    else:
+        search_end = min(page_count, 50)
+
+    results: dict[int, int | None] = {}
+
+    for idx in indices:
+        entry = entries[idx]
+        content = str(entry.get("content", "")).strip()
+        if not content:
+            results[idx] = None
+            continue
+
+        page_num: int | None = None
+
+        # Stage 1: text search in front-matter range.
+        if locate_entry_by_text_search is not None:
+            try:
+                page_num = locate_entry_by_text_search(
+                    resolved,
+                    content,
+                    search_start=1,
+                    search_end=search_end,
+                )
+            except Exception:
+                page_num = None
+
+        # Stage 2: optional VLM heading search when text search fails.
+        if page_num is None and api_key:
+            page_num = locate_heading_by_vlm(
+                resolved,
+                content,
+                search_start=1,
+                search_end=search_end,
+                api_key=api_key,
+                timeout=timeout,
+                api_base=api_base,
+                model=model,
+            )
+
+        results[idx] = page_num
+
+    return results
 
 
 def _get_printed_page_number(
@@ -1029,7 +2083,7 @@ def _query_page_number(
     json_text = _extract_json_block(content)
     try:
         data = json.loads(json_text)
-    except json.JSONDecodeError:
+    except (json.JSONDecodeError, ValueError):
         return None
 
     value = data.get("page_number")

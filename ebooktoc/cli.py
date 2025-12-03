@@ -30,12 +30,20 @@ from .fingerprints import (
     build_canonical_map_for_dims,
 )
 from .pdf_writer import write_pdf_toc
-from .vlm_api import TOCExtractionError, fetch_document_json, _infer_page_offset
+from .vlm_api import (
+    TOCExtractionError,
+    fetch_document_json,
+    _infer_page_offset,
+    _infer_offsets_for_segments,
+)
 from .toc_parser import (
     deduplicate_entries,
     extract_toc_entries,
     filter_entries,
     infer_missing_targets,
+    detect_page_segments,
+    merge_segments_with_offsets,
+    classify_entries,
 )
 from .utils import (
     dump_json,
@@ -543,6 +551,21 @@ def _run_scan(args: argparse.Namespace) -> None:
         return
 
     if save_json:
+        # Detect and persist page-numbering segments (for multi-offset books).
+        segments = detect_page_segments(final_entries)
+        segments_data: list[dict[str, Any]] = []
+        for seg in segments:
+            segments_data.append(
+                {
+                    "start_idx": seg.start_idx,
+                    "end_idx": seg.end_idx,
+                    "segment_type": seg.segment_type,
+                    # Offset is typically inferred at apply-time; keep here
+                    # for forward-compatibility when it is known.
+                    "offset": seg.offset,
+                }
+            )
+
         # Save comprehensive fingerprints for the original source when possible
         src_for_fps = base_stem_source
         if src_for_fps is not None:
@@ -559,6 +582,7 @@ def _run_scan(args: argparse.Namespace) -> None:
         payload = {
             "toc": final_entries,
             "page_offset": page_offset,
+            "segments": segments_data,
             "fingerprints": full_fps,
             "page_map": page_map0,
         }
@@ -713,22 +737,32 @@ def _print_toc_preview(entries: list[dict[str, Any]], page_offset: int | None) -
         return
 
     console.print("[b]TOC Preview[/]")
+    current_segment: str | None = None
     for entry in entries:
+        # Optional segment metadata (present after multi-segment mapping).
+        segment_type = entry.get("_segment_type")
+        if segment_type and segment_type != current_segment:
+            current_segment = segment_type
+            segment_offset = entry.get("_segment_offset", "?")
+            console.print(
+                f"\n[dim]── {segment_type} (offset: {segment_offset}) ──[/]"
+            )
+
         page = entry.get("page")
         target = entry.get("target_page")
-        title = entry.get("content", "").strip()
-        display_target = target if target is not None else "-"
+        original_target = entry.get("_original_target_page", target)
+        title = (entry.get("content") or "").strip()
+
+        display_target = original_target if original_target is not None else "-"
         resolved = None
-        source_value = target if target is not None else entry.get("page")
-        base_page = _coerce_positive_int(source_value)
-        if page_offset is not None and base_page is not None:
-            resolved = base_page + page_offset
-        detail = (
-            f" (PDF page {resolved})" if resolved is not None else ""
-        )
-        console.print(
-            f"- page {page} -> {display_target} : {title}{detail}"
-        )
+        if target is not None and original_target is not None and target != original_target:
+            resolved = target
+        elif page_offset is not None and original_target is not None:
+            # Fallback preview when per-entry offsets are not yet applied.
+            resolved = original_target + page_offset
+
+        detail = f" → PDF {resolved}" if resolved is not None else ""
+        console.print(f"  - p. {display_target}{detail} : {title}")
 
 
 def _prompt_yes_no(question: str, default: bool) -> bool:
@@ -758,9 +792,21 @@ def _apply_page_mapping(
     mapping: dict[int, int],
     page_offset: int | None,
     page_count: int,
+    resolved_override: dict[int, int | None] | None = None,
 ) -> list[dict[str, Any]]:
+    resolved_override = resolved_override or {}
     resolved_entries: list[dict[str, Any]] = []
-    for entry in entries:
+    for idx, entry in enumerate(entries):
+        if idx in resolved_override and resolved_override[idx] is not None:
+            resolved_page = int(resolved_override[idx])  # type: ignore[arg-type]
+            if page_count:
+                resolved_page = max(1, min(resolved_page, page_count))
+            adjusted = dict(entry)
+            adjusted["target_page"] = resolved_page
+            adjusted["_resolved_by"] = "direct_location"
+            resolved_entries.append(adjusted)
+            continue
+
         base_page = _coerce_positive_int(entry.get("target_page"))
         if base_page is None:
             base_page = _coerce_positive_int(entry.get("page"))
@@ -900,6 +946,13 @@ def _run_apply(args: argparse.Namespace) -> None:
         console.print("[yellow]No TOC entries found in JSON. Nothing to apply.[/]")
         return
 
+    # Classify entries up-front so we can optionally resolve unnumbered
+    # and suspicious ones directly in the PDF.
+    try:
+        unnumbered_idx, suspicious_idx, normal_idx = classify_entries(entries)
+    except Exception:
+        unnumbered_idx, suspicious_idx, normal_idx = [], [], list(range(len(entries)))
+
     output_path = (
         args.output
         if args.output is not None
@@ -961,20 +1014,39 @@ def _run_apply(args: argparse.Namespace) -> None:
     if getattr(args, "api_key", None):
         with timed_step("Refining page offset (VLM)", report):
             try:
-                vlm_offset = _infer_page_offset(
-                    pdf_path,
-                    entries,
-                    args.api_key,
-                    args.timeout,
-                    current_fps,
-                    api_base=args.api_base,
-                    model=args.model,
-                )
-                if vlm_offset is not None:
-                    refined_offset = vlm_offset
-                    console.print(
-                        f"[cyan]Refined printed-page offset (VLM): {refined_offset:+d} (was {page_offset}).[/]"
+                infer_pdf_path = pdf_path
+                temp_clean_for_infer: Path | None = None
+
+                if args.goodnotes_clean and dims and current_fps:
+                    keep_indices, removed_indices = _detect_goodnotes_indices_from_fps(
+                        current_fps,
+                        dims,
                     )
+                    if removed_indices and keep_indices:
+                        temp_clean_for_infer, _ = _build_clean_pdf(pdf_path, keep_indices)
+                        infer_pdf_path = temp_clean_for_infer
+
+                try:
+                    vlm_offset = _infer_page_offset(
+                        infer_pdf_path,
+                        entries,
+                        args.api_key,
+                        args.timeout,
+                        current_fps if infer_pdf_path == pdf_path else None,
+                        api_base=args.api_base,
+                        model=args.model,
+                    )
+                    if vlm_offset is not None:
+                        refined_offset = vlm_offset
+                        console.print(
+                            f"[cyan]Refined printed-page offset (VLM): {refined_offset:+d} (was {page_offset}).[/]"
+                        )
+                finally:
+                    if temp_clean_for_infer is not None:
+                        try:
+                            temp_clean_for_infer.unlink(missing_ok=True)
+                        except Exception:
+                            pass
             except TOCExtractionError:
                 # If VLM-based offset refinement fails, keep the previous offset.
                 pass
@@ -1034,20 +1106,111 @@ def _run_apply(args: argparse.Namespace) -> None:
             except Exception:
                 pass
     else:
-        canonical_map: dict[int, int] = {}
-        if dims and current_fps:
-            canonical_map = build_canonical_map_for_dims(current_fps, dims)
-        refined_offset = _refine_offset_with_mapping(
-            entries, canonical_map, refined_offset
-        )
-        if refined_offset != page_offset and not getattr(args, "override_offset", None):
-            console.print(
-                f"[cyan]Refined printed-page offset: {refined_offset:+d} (was {page_offset}).[/]"
+        # Non-GoodNotes path: support multi-segment page numbering.
+        segments = detect_page_segments(entries)
+
+        # Attempt to resolve unnumbered/suspicious entries directly when possible.
+        resolved_unnumbered: dict[int, int | None] = {}
+        if (unnumbered_idx or suspicious_idx) and pdf_path is not None:
+            from .vlm_api import resolve_unnumbered_entries
+
+            try:
+                with timed_step("Locating unnumbered/suspicious entries", report):
+                    resolved_unnumbered = resolve_unnumbered_entries(
+                        pdf_path,
+                        entries,
+                        unnumbered_idx,
+                        suspicious_idx,
+                        first_body_pdf_page=None,
+                        api_key=getattr(args, "api_key", None),
+                        timeout=args.timeout,
+                        api_base=getattr(args, "api_base", None),
+                        model=getattr(args, "model", None),
+                    )
+                located = sum(1 for v in resolved_unnumbered.values() if v is not None)
+                total_special = len(resolved_unnumbered)
+                if total_special:
+                    console.print(
+                        f"[cyan]Directly located {located}/{total_special} unnumbered/suspicious entries.[/]"
+                    )
+            except Exception:
+                resolved_unnumbered = {}
+
+        if len(segments) <= 1:
+            # Single segment: retain existing canonical-map refinement logic.
+            canonical_map: dict[int, int] = {}
+            if dims and current_fps:
+                canonical_map = build_canonical_map_for_dims(current_fps, dims)
+            refined_offset = _refine_offset_with_mapping(
+                entries, canonical_map, refined_offset
             )
-        with timed_step("Mapping TOC entries", report):
-            resolved_entries = _apply_page_mapping(
-                entries, canonical_map, refined_offset, page_count
-            )
+            if refined_offset != page_offset and not getattr(args, "override_offset", None):
+                console.print(
+                    f"[cyan]Refined printed-page offset: {refined_offset:+d} (was {page_offset}).[/]"
+                )
+            with timed_step("Mapping TOC entries", report):
+                resolved_entries = _apply_page_mapping(
+                    entries,
+                    canonical_map,
+                    refined_offset,
+                    page_count,
+                    resolved_override=resolved_unnumbered,
+                )
+        else:
+            console.print(f"[cyan]Detected {len(segments)} page-numbering segments.[/]")
+
+            if getattr(args, "api_key", None):
+                # Use VLM to infer per-segment offsets when an API key is available.
+                with timed_step("Inferring segment offsets (VLM)", report):
+                    _infer_offsets_for_segments(
+                        pdf_path,
+                        segments,
+                        args.api_key,
+                        args.timeout,
+                        api_base=args.api_base,
+                        model=args.model,
+                    )
+                    for seg in segments:
+                        off = getattr(seg, "offset", None)
+                        offset_str = f"{off:+d}" if isinstance(off, int) else "unknown"
+                        console.print(
+                            f"  - {seg.segment_type}: {len(seg.entries)} entries, offset={offset_str}"
+                        )
+            else:
+                # Without an API key, prefer any segment offsets stored in the
+                # JSON payload; otherwise fall back to a single refined offset.
+                saved_segments = (
+                    raw_data.get("segments", []) if isinstance(raw_data, dict) else []
+                )
+                if saved_segments:
+                    for idx, seg in enumerate(segments):
+                        if idx < len(saved_segments):
+                            stored = saved_segments[idx]
+                            try:
+                                stored_off = int(stored.get("offset"))  # type: ignore[arg-type]
+                            except (TypeError, ValueError):
+                                stored_off = None
+                            if stored_off is not None:
+                                seg.offset = stored_off
+                else:
+                    for seg in segments:
+                        seg.offset = refined_offset
+
+            with timed_step("Mapping TOC entries (multi-segment)", report):
+                resolved_entries = merge_segments_with_offsets(
+                    segments,
+                    page_count,
+                    resolved_override=resolved_unnumbered,
+                )
+                # Clamp resolved target_page values into the valid page range.
+                if page_count > 0:
+                    for entry in resolved_entries:
+                        tp = entry.get("target_page")
+                        try:
+                            if tp is not None:
+                                entry["target_page"] = max(1, min(int(tp), page_count))
+                        except (TypeError, ValueError):
+                            continue
 
     try:
         if is_interactive():

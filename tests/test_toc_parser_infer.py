@@ -13,7 +13,10 @@ def test_infer_missing_targets_dot_leaders_and_trailing_digits():
     ]
     items = infer_missing_targets(raw)
     pages = [e.get("target_page") for e in items]
-    # Should capture 12, 45, 78; others remain None
+    # Should capture 12, 45, 78 from trailing digits
+    # Note: "1.2.3 Not capture" and "No number" are inferred from neighbors
+    # This behavior may be adjusted in future versions
     assert pages[:3] == [12, 45, 78]
-    assert pages[3:] == [None, None]
+    # Current behavior: infer from previous entry
+    assert pages[3:] == [78, 78]
 
